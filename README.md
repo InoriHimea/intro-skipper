@@ -1,4 +1,17 @@
-# Intro Skipper
+# Intro Skipper — Inori 片尾缓冲 fork
+
+> [!IMPORTANT]
+> **这是非官方维护分支，不是上游发布包。** 基于上游 `12.0/v12.0.4.0`，仅为播放 API 返回的片尾片段增加保留尾部的保护。
+> 设置 `IntroEndOffset=5` 且媒体时长已知时，片尾跳转终点不晚于媒体结束前 5 秒；已有更长间隙不延长。
+> **不改检测结果、数据库、分析 hash 或编辑接口，不要求为旧片段全库重扫。** 未据本地测试声称已完成群晖/Infuse 实际播放验收。
+
+- [补丁说明、90 秒示例与复测方法](patches/outro-tail/README.md)
+- [本 fork 的版本发布](https://github.com/InoriHimea/intro-skipper/releases)
+- [上游原始项目](https://github.com/intro-skipper/intro-skipper)
+
+补丁发行标签独立于程序集版本，例如 `12.0/v12.0.4.0-inori-tail5s.1`；DLL 仍为 `IntroSkipper.dll`、程序集/文件版本仍为 `12.0.4.0`。请按 Release 标签、源码提交和 SHA256 区分本地补丁与同版本官方 DLL。下方保留上游介绍、署名和许可；其中上游徽章、签名和 manifest 不代表本 fork 的验证或签名，官方 manifest 也不会安装本补丁。
+
+## 上游项目说明
 
 <div align="center">
     <p>

@@ -93,9 +93,11 @@ namespace IntroSkipper
                 serviceProvider.GetRequiredService<ILogger<SegmentChange>>()));
             serviceCollection.AddSingleton<IHostedService>(serviceProvider => serviceProvider.GetRequiredService<SegmentChange>());
             serviceCollection.AddSingleton<MediaSegmentsFirstEpisodeFilter>();
+            serviceCollection.AddSingleton<PlaybackOutroTailFilter>();
             serviceCollection.Configure<MvcOptions>(options =>
             {
                 options.Conventions.Add(new MediaSegmentsFilterConvention());
+                options.Conventions.Add(new PlaybackOutroTailFilterConvention());
             });
         }
     }
