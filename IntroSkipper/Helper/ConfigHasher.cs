@@ -36,6 +36,18 @@ internal static class ConfigHasher
     /// re-analyzed once when Chromaprint becomes available instead of being skipped forever.</param>
     /// <returns>A compact hex hash.</returns>
     public static string Analysis(PluginConfiguration config, AnalysisMode mode, AnalyzerAction action, bool ffmpegValid)
+        => Analysis(config, mode, action, ffmpegValid, config.EnableCommunityFallback);
+
+    /// <summary>
+    /// Computes the analysis hash as if the community fallback were switched to <paramref name="communityFallback"/>.
+    /// </summary>
+    /// <param name="config">Plugin configuration.</param>
+    /// <param name="mode">Analysis mode.</param>
+    /// <param name="action">Analyzer priority/action used for the season.</param>
+    /// <param name="ffmpegValid">Whether the current FFmpeg build supports Chromaprint.</param>
+    /// <param name="communityFallback">Whether the community token is included.</param>
+    /// <returns>A compact hex hash.</returns>
+    public static string Analysis(PluginConfiguration config, AnalysisMode mode, AnalyzerAction action, bool ffmpegValid, bool communityFallback)
     {
         var input = mode switch
         {
@@ -43,7 +55,7 @@ internal static class ConfigHasher
                 $"analysis|v1|mode={mode}|action={action}|prefer={config.PreferChromaprint}|chap={config.ChapterAnalyzerIntroductionPattern}|fullchap={config.FullLengthChapters}|sbchap={config.EnableSponsorBlockChapterDetection}",
                 $"|pct={config.AnalysisPercent}|limit={config.AnalysisLengthLimit}|min={config.MinimumIntroDuration}|max={config.MaximumIntroDuration}",
                 $"|fpbits={config.MaximumFingerprintPointDifferences}|skip={config.MaximumTimeSkip}|shift={config.InvertedIndexShift}|chromaprint={ffmpegValid}{ChromaprintStreamToken(config)}",
-                $"{AdjustmentHash(config)}"),
+                $"{AdjustmentHash(config)}{CommunityToken(config, communityFallback)}"),
 
             // Frozen at v3 on purpose: the credits pass replaced the first-wins chain
             // without a bump, because a bump re-fingerprints and re-scans every season a chapter
@@ -58,7 +70,7 @@ internal static class ConfigHasher
                 $"|bflegacy={config.UseLegacyBlackFrameAnalyzer}|bfrefine={config.RefineCreditsBoundary}|bfVersion=3{CreditsNonBlackToken(config)}",
                 $"|fpbits={config.MaximumFingerprintPointDifferences}|skip={config.MaximumTimeSkip}|shift={config.InvertedIndexShift}|chromaprint={ffmpegValid}{ChromaprintStreamToken(config)}",
                 $"|animePreview={config.AnimePreviewFromCreditsEnd}",
-                $"{AdjustmentHash(config)}"),
+                $"{AdjustmentHash(config)}{CommunityToken(config, communityFallback)}"),
 
             AnalysisMode.Recap => Invariant(
                 $"analysis|v3|mode={mode}|action={action}|prefer={config.PreferChromaprint}|chap={config.ChapterAnalyzerRecapPattern}|fullchap={config.FullLengthChapters}|sbchap={config.EnableSponsorBlockChapterDetection}|min={config.MinimumRecapDuration}|max={config.MaximumRecapDuration}",
@@ -230,6 +242,14 @@ internal static class ConfigHasher
     // the option existed and does not re-analyze every recap on upgrade.
     private static string RecapColdOpenToken(PluginConfiguration config)
         => config.AnchorRecapToColdOpen ? "|coldOpen=True" : string.Empty;
+
+    // Only present when enabled so the default-off configuration keeps the hash it had before
+    // the option existed. Toggling it reopens only results without a segment (see
+    // CommunityHashAdoption), so local results are not recomputed.
+    private static string CommunityToken(PluginConfiguration config, bool enabled)
+        => enabled
+            ? FormattableString.Invariant($"|community=v1|introdb={config.CommunityUseIntroDb}|theintrodb={config.CommunityUseTheIntroDb}|tol={config.CommunityDurationToleranceSeconds}")
+            : string.Empty;
 
     private static string ChromaprintStreamToken(PluginConfiguration config)
         => FormattableString.Invariant(

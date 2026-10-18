@@ -22,6 +22,7 @@ export interface PluginConfig {
     ScanTimeoutSeconds: number;
     IntroEndOffset: number;
     IntroStartOffset: number;
+    CommunityDurationToleranceSeconds: number;
     SkipbuttonHideDelay: number;
     SkipButtonVisibleSeconds: number;
     SilenceDetectionMaximumNoise: number;
@@ -77,6 +78,9 @@ export interface PluginConfig {
     UseFileTransformationPlugin: boolean;
     AutoSkipIntro: boolean;
     AutoSkipCredits: boolean;
+    EnableCommunityFallback: boolean;
+    CommunityUseIntroDb: boolean;
+    CommunityUseTheIntroDb: boolean;
 
     // Server-managed flag exposed to the dashboard.
     readonly FileTransformationPluginEnabled: boolean;

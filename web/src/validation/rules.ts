@@ -48,6 +48,7 @@ export const validationRules: Partial<Record<keyof PluginConfig, ValidationRule<
     MaxParallelism: [minValue(1)],
     ProcessThreads: [range(0, 16)],
     ScanTimeoutSeconds: [minValue(0)],
+    CommunityDurationToleranceSeconds: [range(0, 600)],
     SkipbuttonHideDelay: [range(0, 1000)],
     SkipButtonVisibleSeconds: [range(0, 600)],
     SilenceDetectionMaximumNoise: [range(-90, 0)],

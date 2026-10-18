@@ -7,6 +7,7 @@
 
 using IntroSkipper.Analyzers;
 using IntroSkipper.Analyzers.Credits;
+using IntroSkipper.Community;
 using IntroSkipper.Configuration;
 using IntroSkipper.Data;
 using IntroSkipper.Db;
@@ -43,6 +44,11 @@ public partial class BaseItemAnalyzerTask(
     private readonly IFFmpegService _ffmpegService = ffmpegService;
     private readonly DetectionCacheService _cacheService = cacheService;
     private readonly IIntroSkipperDatabase _database = database;
+
+    /// <summary>
+    /// Gets the community fallback of this run; <see langword="null"/> disables it.
+    /// </summary>
+    internal CommunityFallback? CommunityFallback { get; init; }
 
     /// <summary>
     /// Gets the live plugin configuration. Jellyfin replaces the configuration object on save, so
@@ -277,6 +283,12 @@ public partial class BaseItemAnalyzerTask(
         else
         {
             await RunAnalyzerChainAsync(items, mode, action, ffmpegValid, isMovie, cancellationToken).ConfigureAwait(false);
+        }
+
+        // Community timestamps fill only what local analysis left empty.
+        if (CommunityFallback is not null)
+        {
+            await CommunityFallback.FillAsync(items, mode, Config, cancellationToken).ConfigureAwait(false);
         }
 
         // Anime previews derive from the credits: right after a credits result lands, and again

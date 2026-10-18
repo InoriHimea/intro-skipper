@@ -1,6 +1,7 @@
 // SPDX-FileCopyrightText: 2026 rlauuzo
 // SPDX-License-Identifier: GPL-3.0-only
 
+using IntroSkipper.Community;
 using IntroSkipper.Db;
 using IntroSkipper.FFmpeg;
 using IntroSkipper.ScheduledTasks;
@@ -25,6 +26,7 @@ namespace IntroSkipper.Manager;
 /// <param name="ffmpegService">FFmpeg service.</param>
 /// <param name="cacheService">Detection cache service.</param>
 /// <param name="database">Segment database facade.</param>
+/// <param name="communitySources">Community timestamp sources.</param>
 public class AnalyzerTaskFactory(
     ILoggerFactory loggerFactory,
     ILibraryManager libraryManager,
@@ -32,8 +34,11 @@ public class AnalyzerTaskFactory(
     IFileSystem fileSystem,
     IFFmpegService ffmpegService,
     DetectionCacheService cacheService,
-    IIntroSkipperDatabase database)
+    IIntroSkipperDatabase database,
+    IEnumerable<ICommunitySource>? communitySources = null)
 {
+    private readonly IReadOnlyList<ICommunitySource> _communitySources = communitySources?.ToList() ?? [];
+
     /// <summary>
     /// Creates a fresh queue manager for one enumeration run.
     /// </summary>
@@ -58,5 +63,11 @@ public class AnalyzerTaskFactory(
             this,
             ffmpegService,
             cacheService,
-            database);
+            database)
+        {
+            // One fallback per run: its answer cache spans the run's intro and credits passes.
+            CommunityFallback = _communitySources.Count == 0
+                ? null
+                : new CommunityFallback(loggerFactory.CreateLogger<CommunityFallback>(), _communitySources, ffmpegService, database),
+        };
 }

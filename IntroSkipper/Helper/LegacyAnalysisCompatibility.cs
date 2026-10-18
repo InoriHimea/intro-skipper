@@ -42,7 +42,9 @@ internal static class LegacyAnalysisCompatibility
             var upgrades = new Dictionary<string, string>(StringComparer.Ordinal);
             foreach (var available in new[] { false, true })
             {
-                var currentHash = ConfigHasher.Analysis(config, mode, action, available);
+                // Older releases had no community fallback; CommunityHashAdoption moves the
+                // result on to the fallback-on hash afterwards, keeping empty results open.
+                var currentHash = ConfigHasher.Analysis(config, mode, action, available, communityFallback: false);
                 foreach (var release in new[] { 22, 23, 24 })
                 {
                     if (release < 24 && (config.IncludeIntroStartOffsetWhenSnapping

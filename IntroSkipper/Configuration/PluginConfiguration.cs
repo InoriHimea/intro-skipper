@@ -412,6 +412,33 @@ public class PluginConfiguration : BasePluginConfiguration
     /// </summary>
     public bool IncludeIntroStartOffsetWhenSnapping { get; set; }
 
+    // ===== Community fallback =====
+
+    /// <summary>
+    /// Gets or sets a value indicating whether an episode or movie the local analyzers settled
+    /// without an intro or credits segment is looked up in the community timestamp databases.
+    /// Local analysis always runs first; a community result never replaces a local one.
+    /// </summary>
+    public bool EnableCommunityFallback { get; set; }
+
+    /// <summary>
+    /// Gets or sets a value indicating whether IntroDB (introdb.app) is queried by the community fallback.
+    /// </summary>
+    public bool CommunityUseIntroDb { get; set; } = true;
+
+    /// <summary>
+    /// Gets or sets a value indicating whether TheIntroDB (theintrodb.org) is queried by the community fallback.
+    /// </summary>
+    public bool CommunityUseTheIntroDb { get; set; } = true;
+
+    /// <summary>
+    /// Gets or sets how many seconds a community timestamp set may disagree with the local file:
+    /// a segment may end at most this far past the end of the file, and a source that reports the
+    /// duration of the release it was measured on must match the local duration within it.
+    /// A larger mismatch means the timestamps belong to a different release.
+    /// </summary>
+    public int CommunityDurationToleranceSeconds { get; set; } = 5;
+
     // ===== Internal algorithm settings =====
 
     /// <summary>

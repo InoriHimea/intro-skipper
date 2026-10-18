@@ -45,5 +45,11 @@ public enum SegmentSource
     /// <summary>
     /// Built by the credits pass from overlapping or adjacent candidates of more than one analyzer.
     /// </summary>
-    Combined = 6
+    Combined = 6,
+
+    /// <summary>
+    /// Fetched from a community timestamp database (IntroDB or TheIntroDB) for an
+    /// episode the local analyzers settled without a segment.
+    /// </summary>
+    Community = 7
 }

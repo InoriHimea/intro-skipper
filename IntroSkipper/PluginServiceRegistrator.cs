@@ -3,6 +3,7 @@
 // SPDX-FileCopyrightText: 2024-2026 Kilian von Pflugk
 // SPDX-License-Identifier: GPL-3.0-only
 
+using IntroSkipper.Community;
 using IntroSkipper.Db;
 using IntroSkipper.FFmpeg;
 using IntroSkipper.Filters;
@@ -57,6 +58,11 @@ namespace IntroSkipper
             // therefore created fresh by this factory instead of being singletons.
             serviceCollection.AddSingleton<AnalyzerTaskFactory>();
             serviceCollection.AddSingleton<DetectionCacheService>();
+            // Community timestamp databases, asked only for items local analysis left
+            // empty and only while the fallback is enabled. Singletons so the per-source
+            // pacing and rate-limit cool-down span every analysis run.
+            serviceCollection.AddSingleton<ICommunitySource, IntroDbSource>();
+            serviceCollection.AddSingleton<ICommunitySource, TheIntroDbSource>();
             serviceCollection.AddSingleton<IFFmpegService, FFmpegService>();
             // Shared plugin-to-Jellyfin segment conversion plus the direct writer into
             // Jellyfin's MediaSegments table; the provider stays registered so

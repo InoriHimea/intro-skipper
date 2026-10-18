@@ -4,6 +4,7 @@
 // SPDX-FileCopyrightText: 2024-2026 Kilian von Pflugk
 // SPDX-License-Identifier: GPL-3.0-only
 
+using IntroSkipper.Community;
 using IntroSkipper.Data;
 using IntroSkipper.Db;
 using IntroSkipper.FFmpeg;
@@ -522,6 +523,12 @@ internal partial class QueueManager(ILogger<QueueManager> logger, ILibraryManage
         var ffmpegValid = await GetFfmpegValidAsync(cancellationToken).ConfigureAwait(false);
         var snapshot = await _database.GetSeasonQueueSnapshotAsync(candidates[0].SeasonId, [.. candidates.Select(c => c.EpisodeId)], cancellationToken).ConfigureAwait(false);
         if (await LegacyAnalysisCompatibility.UpgradeAsync(_database, snapshot, plugin.Configuration, cancellationToken).ConfigureAwait(false))
+        {
+            snapshot = await _database.GetSeasonQueueSnapshotAsync(candidates[0].SeasonId, [.. candidates.Select(c => c.EpisodeId)], cancellationToken).ConfigureAwait(false);
+        }
+
+        // After the legacy upgrade, which lands on the fallback-off hash.
+        if (await CommunityHashAdoption.UpgradeAsync(_database, snapshot, plugin.Configuration, cancellationToken).ConfigureAwait(false))
         {
             snapshot = await _database.GetSeasonQueueSnapshotAsync(candidates[0].SeasonId, [.. candidates.Select(c => c.EpisodeId)], cancellationToken).ConfigureAwait(false);
         }
