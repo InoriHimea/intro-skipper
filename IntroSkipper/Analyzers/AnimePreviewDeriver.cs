@@ -1,4 +1,5 @@
 // SPDX-FileCopyrightText: 2026 rlauuzo
+// SPDX-FileCopyrightText: 2026 AbandonedCart
 // SPDX-License-Identifier: GPL-3.0-only
 
 using IntroSkipper.Data;
@@ -7,8 +8,7 @@ using IntroSkipper.Db;
 namespace IntroSkipper.Analyzers;
 
 /// <summary>
-/// Derives an anime episode's Preview segment: the span after the first credits block, up to
-/// the next credits block (a trailing dubbing or sponsor card) or the end of the episode.
+/// Derives an episode's Preview segment from the end of its last credits block to the end of the episode.
 /// </summary>
 internal static class AnimePreviewDeriver
 {
@@ -26,16 +26,29 @@ internal static class AnimePreviewDeriver
     /// An episode with a user-provided Preview is skipped: the admission gate only drops a derived
     /// preview that strictly overlaps it, so without this guard a non-overlapping manual Preview
     /// would gain a second, automatic one beside it, and the episode's UserProvided state would be
-    /// overwritten with Analyzed. A derived preview that overlaps a tombstone is dropped by
+    /// overwritten with Analyzed. A derived preview within the range of a tombstone is dropped by
     /// <see cref="AutoSegmentAdmissionPolicy"/>; the episode still counts as analyzed, since
-    /// re-running would not change the gate's answer.
+    /// re-running would not change the gate's answer. An episode with any other automatic
+    /// Preview, a subtitle or chapter match, is skipped too. The facade ranks a derived preview
+    /// below both and would refuse the write, and the episode stays unsettled so its Preview
+    /// pass can retire that row once it is stale and then derive the preview.
     /// </remarks>
     /// <param name="database">Segment database facade.</param>
-    /// <param name="items">Episodes whose Credits mode was just analyzed.</param>
+    /// <param name="items">Episodes whose Credits or Preview mode was just analyzed.</param>
     /// <param name="minimumDuration">The minimum preview duration in seconds; shorter spans derive nothing.</param>
     /// <param name="cancellationToken">Cancellation token; stops the loop before the next episode.</param>
+    /// <param name="settlePreviewState">
+    /// <see langword="true"/> to mark each episode that gets a derived preview as analyzed for
+    /// Preview; <see langword="false"/> to leave every Preview state as it is, for a credits pass
+    /// followed by subtitle Preview detection, which can still supersede the derived preview.
+    /// </param>
     /// <returns>A task that completes when every episode has been considered.</returns>
-    internal static async Task DeriveAsync(IIntroSkipperDatabase database, IReadOnlyList<QueuedEpisode> items, int minimumDuration, CancellationToken cancellationToken)
+    internal static async Task DeriveAsync(
+        IntroSkipperDatabase database,
+        IReadOnlyList<QueuedEpisode> items,
+        int minimumDuration,
+        CancellationToken cancellationToken,
+        bool settlePreviewState = true)
     {
         foreach (var episode in items)
         {
@@ -44,19 +57,19 @@ internal static class AnimePreviewDeriver
                 break;
             }
 
+            // Any other preview wins, and the episode stays unsettled: its Preview pass may
+            // delete a stale chapter or subtitle row, and only an unsettled episode gets that
+            // pass's analyzers and derive afterwards.
             var dbSegments = await database.GetSegmentsAsync(episode.EpisodeId, cancellationToken: cancellationToken).ConfigureAwait(false);
-            if (dbSegments.Any(s => s.Type == AnalysisMode.Preview && s.Source == SegmentSource.User))
+            if (dbSegments.Any(s => s.Type == AnalysisMode.Preview && s.Source != SegmentSource.CreditsDerived))
             {
                 continue;
             }
 
-            // The preview follows the first credits run and ends where the next run starts (a
-            // trailing dubbing or sponsor card) or at the end of the episode. Rows that touch or
-            // overlap, as adjusted neighbours can, count as one run, and a row's source does not
-            // matter: a card the user edited is still the boundary it was.
-            var runs = CreditsRuns(dbSegments);
-            var credits = runs.FirstOrDefault();
-            var previewEnd = runs.Count > 1 ? runs[1].Start : episode.Duration;
+            // Rows that touch or overlap, as adjusted neighbours can, form one credits run. The
+            // post-credits preview begins after the last run and reaches the episode end.
+            var credits = CreditsRuns(dbSegments).LastOrDefault();
+            var previewEnd = episode.Duration;
             List<Segment> previews = [.. dbSegments
                 .Where(s => s.Type == AnalysisMode.Preview)
                 .Select(s => s.ToSegment())];
@@ -64,6 +77,26 @@ internal static class AnimePreviewDeriver
             var preview = Compute(episode.EpisodeId, previewEnd, credits, previews, minimumDuration);
             if (preview is null)
             {
+                if (credits is { Valid: true } && previewEnd - credits.End >= minimumDuration)
+                {
+                    var matchingPreview = dbSegments.FirstOrDefault(segment =>
+                        segment.Type == AnalysisMode.Preview
+                        && segment.Source == SegmentSource.CreditsDerived
+                        && segment.State == SegmentState.Active
+                        && Math.Abs(TickConversions.ToSeconds(segment.StartTicks) - credits.End) <= StartTolerance
+                        && Math.Abs(TickConversions.ToSeconds(segment.EndTicks) - previewEnd) <= StartTolerance);
+                    if (matchingPreview is not null && matchingPreview.ConfigHash != episode.AnalysisConfigHash)
+                    {
+                        await database.ReplaceAutoSegmentsAsync(
+                            episode.EpisodeId,
+                            AnalysisMode.Preview,
+                            [matchingPreview.ToSegment()],
+                            SegmentSource.CreditsDerived,
+                            episode.AnalysisConfigHash,
+                            cancellationToken).ConfigureAwait(false);
+                    }
+                }
+
                 // Nothing derivable (no credits, or too little between the credits and the
                 // preview end) leaves a preview derived by an earlier run stale: clear it so it
                 // cannot overlap the credits that replaced its source.
@@ -77,7 +110,10 @@ internal static class AnimePreviewDeriver
             }
 
             await database.ReplaceAutoSegmentsAsync(episode.EpisodeId, AnalysisMode.Preview, [preview], SegmentSource.CreditsDerived, episode.AnalysisConfigHash, cancellationToken).ConfigureAwait(false);
-            episode.SetAnalyzed(AnalysisMode.Preview, EpisodeState.Analyzed);
+            if (settlePreviewState && episode.GetAnalyzed(AnalysisMode.Preview) != EpisodeState.AnalysisFailed)
+            {
+                episode.SetAnalyzed(AnalysisMode.Preview, EpisodeState.Analyzed);
+            }
         }
     }
 
@@ -105,18 +141,18 @@ internal static class AnimePreviewDeriver
     }
 
     /// <summary>
-    /// Decides whether an anime Preview segment needs to be written for an episode, and builds it.
+    /// Decides whether a credits-derived Preview segment needs to be written for an episode, and builds it.
     /// </summary>
     /// <remarks>
     /// Returns a new Segment when the Preview is missing, its Start no longer matches the current
     /// credits.End (e.g. because settings changed and Credits was re-analyzed), or its End no longer
-    /// matches <paramref name="previewEnd"/> (e.g. because the underlying media file was replaced).
+    /// matches the episode end (e.g. because the underlying media file was replaced).
     /// Returns <see langword="null"/> when there are no valid credits, less than
     /// <paramref name="minimumDuration"/> remains before the preview end, or any existing Preview
     /// already matches both the current credits.End and the preview end within <see cref="StartTolerance"/>.
     /// </remarks>
     /// <param name="episodeId">Episode id.</param>
-    /// <param name="previewEnd">Where the preview ends in seconds: the next credits block's start, or the episode duration.</param>
+    /// <param name="previewEnd">Episode duration, which is the end of the post-credits preview.</param>
     /// <param name="credits">The credits run feeding the preview, or <see langword="null"/>.</param>
     /// <param name="existingPreviews">All current Preview segments of the episode.</param>
     /// <param name="minimumDuration">The minimum preview duration in seconds.</param>

@@ -21,3 +21,5 @@ web/node_modules
 
 # Local fork build/test output; never publish private host references or logs.
 /artifacts/
+# CreditsRunner manifests, labels and results name real media and hardware
+tools/CreditsRunner/**/*.json

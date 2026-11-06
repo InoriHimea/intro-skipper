@@ -1,4 +1,5 @@
 // SPDX-FileCopyrightText: 2026 rlauuzo
+// SPDX-FileCopyrightText: 2026 AbandonedCart
 // SPDX-License-Identifier: GPL-3.0-only
 
 using System.Security.Cryptography;
@@ -18,22 +19,41 @@ namespace IntroSkipper.Helper;
 /// </summary>
 internal static class LegacyAnalysisCompatibility
 {
+    /// <summary>
+    /// Rewrites the season's 10.11 completion records, and their active automatic segments,
+    /// to the hash the current settings expect, for every mode whose 10.11 hash the retained
+    /// settings reproduce.
+    /// </summary>
+    /// <param name="database">The segment database.</param>
+    /// <param name="snapshot">The season's stored analysis state.</param>
+    /// <param name="config">Plugin configuration.</param>
+    /// <param name="excludedModes">Modes a season override changed, which are never adopted.</param>
+    /// <param name="previewFromCreditsEndOverride">Whether the season derives previews from the
+    /// credits end, which the current Credits hash carries; <see langword="null"/> uses
+    /// <see cref="PluginConfiguration.AnimePreviewFromCreditsEnd"/>.</param>
+    /// <param name="cancellationToken">Cancellation token.</param>
+    /// <returns><see langword="true"/> if a record was rewritten; otherwise, <see langword="false"/>.</returns>
     internal static async Task<bool> UpgradeAsync(
-        IIntroSkipperDatabase database,
+        IntroSkipperDatabase database,
         SeasonQueueSnapshot snapshot,
         PluginConfiguration config,
+        IReadOnlySet<AnalysisMode>? excludedModes = null,
+        bool? previewFromCreditsEndOverride = null,
         CancellationToken cancellationToken = default)
     {
         var updated = false;
-        foreach (var modeGroup in snapshot.AnalyzedConfigHashes.GroupBy(pair => pair.Key.Mode))
+        foreach (var modeGroup in snapshot.AnalysisRecords.GroupBy(pair => pair.Key.Mode))
         {
             var mode = modeGroup.Key;
-            var usesChromaprint = mode is AnalysisMode.Introduction or AnalysisMode.Credits or AnalysisMode.Recap;
+            // Recap and Preview are never adopted, because 12.0 changed how both are detected
+            // and a 10.11 result under an older hash is not what the current settings produce.
             if (!AnalysisHelpers.IsSupported(mode)
-                || (usesChromaprint && (ConfigHasher.NormalizeAudioLanguage(config.PreferredAudioLanguage).Length != 0
-                    || !config.PreferAudioStreamWithMostChannels))
-                || (mode == AnalysisMode.Credits && config.UseLegacyBlackFrameAnalyzer)
-                || (mode == AnalysisMode.Recap && config.AnchorRecapToColdOpen))
+                || mode is AnalysisMode.Recap or AnalysisMode.Preview
+                || excludedModes?.Contains(mode) == true
+                || ((mode is AnalysisMode.Introduction or AnalysisMode.Credits)
+                    && (ConfigHasher.NormalizeAudioLanguage(config.PreferredAudioLanguage).Length != 0
+                        || !config.PreferAudioStreamWithMostChannels))
+                || (mode == AnalysisMode.Credits && (config.UseLegacyBlackFrameAnalyzer || config.EnhanceChapterCredits)))
             {
                 continue;
             }
@@ -42,13 +62,22 @@ internal static class LegacyAnalysisCompatibility
             var upgrades = new Dictionary<string, string>(StringComparer.Ordinal);
             foreach (var available in new[] { false, true })
             {
-                // Older releases had no community fallback; CommunityHashAdoption moves the
-                // result on to the fallback-on hash afterwards, keeping empty results open.
-                var currentHash = ConfigHasher.Analysis(config, mode, action, available, communityFallback: false);
+                // The target is the hash the pass expects for this season. 10.11 derived previews
+                // for anime only, so a season that does not derive them got the same credits from
+                // 10.11 whatever the plugin-wide setting was. 10.11 read Jellyfin's chapter table,
+                // so the adopted record names that source; with embedded chapters on, the pass's
+                // chapter source check decides per episode whether the file holds the same chapters.
+                var currentHash = ConfigHasher.Analysis(
+                    config,
+                    mode,
+                    action,
+                    available,
+                    previewFromCreditsEndOverride: previewFromCreditsEndOverride,
+                    chapterSource: ChapterSource.JellyfinTable,
+                    communityFallback: false);
                 foreach (var release in new[] { 22, 23, 24 })
                 {
-                    if (release < 24 && (config.IncludeIntroStartOffsetWhenSnapping
-                        || mode is AnalysisMode.Credits or AnalysisMode.Preview))
+                    if (release < 24 && (config.IncludeIntroStartOffsetWhenSnapping || mode == AnalysisMode.Credits))
                     {
                         continue;
                     }
@@ -61,7 +90,7 @@ internal static class LegacyAnalysisCompatibility
                 }
             }
 
-            foreach (var hashGroup in modeGroup.GroupBy(pair => pair.Value))
+            foreach (var hashGroup in modeGroup.GroupBy(pair => pair.Value.ConfigHash))
             {
                 if (upgrades.TryGetValue(hashGroup.Key, out var currentHash) && hashGroup.Key != currentHash)
                 {

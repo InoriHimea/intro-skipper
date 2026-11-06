@@ -2,7 +2,9 @@
 // SPDX-FileCopyrightText: 2026 AbandonedCart
 // SPDX-License-Identifier: GPL-3.0-only
 
+using IntroSkipper.Configuration;
 using IntroSkipper.Data;
+using MediaBrowser.Model.Entities;
 
 namespace IntroSkipper.FFmpeg;
 
@@ -38,9 +40,10 @@ public interface IFFmpegService
     /// <param name="episode">Queued episode.</param>
     /// <param name="range">Time range to search.</param>
     /// <param name="mode">Analysis mode, used to correctly key the cache entry.</param>
+    /// <param name="config">The configuration the scan runs under; its cache row is hashed under it.</param>
     /// <param name="cancellationToken">Token used to cancel the FFmpeg process.</param>
     /// <returns>A task that returns TimeRange objects that are silent in the queued episode.</returns>
-    Task<TimeRange[]> DetectSilenceAsync(QueuedEpisode episode, TimeRange range, AnalysisMode mode, CancellationToken cancellationToken = default);
+    Task<TimeRange[]> DetectSilenceAsync(QueuedEpisode episode, TimeRange range, AnalysisMode mode, PluginConfiguration config, CancellationToken cancellationToken = default);
 
     /// <summary>
     /// Finds the location of all black frames in a media file within a time range.
@@ -48,55 +51,62 @@ public interface IFFmpegService
     /// <param name="episode">Media file to analyze.</param>
     /// <param name="range">Time range to search.</param>
     /// <param name="minimum">Percentage of the frame that must be black.</param>
-    /// <param name="threshold">Threshold for black frame detection.</param>
     /// <param name="mode">Analysis mode, used to correctly key the cache entry.</param>
+    /// <param name="config">The configuration the scan runs under; its black-frame threshold drives the scan and its cache row is hashed under it.</param>
     /// <param name="cancellationToken">Token used to cancel the FFmpeg process.</param>
     /// <returns>A task that returns frames that are mostly black.</returns>
     Task<BlackFrame[]> DetectBlackFramesAsync(
         QueuedEpisode episode,
         TimeRange range,
         int minimum,
-        int threshold,
         AnalysisMode mode,
+        PluginConfiguration config,
         CancellationToken cancellationToken = default);
 
     /// <summary>
-    /// Finds the black level of every keyframe from the credits start to the end of the file.
+    /// Scans the keyframes from the credits start to the end of the file: one page per keyframe,
+    /// with its black percentage and, inside the credits window, its luma percentiles, saturation and
+    /// frame difference.
     /// </summary>
     /// <remarks>
-    /// A cache miss is one keyframe scan: it also caches the keyframe visuals of the credits
-    /// window, so a following <see cref="DetectKeyframeVisualsAsync"/> for the same episode
-    /// reads that row instead of decoding again.
+    /// One keyframe decode writes two cache rows, the black-frame row and the visuals row. This reads
+    /// each row, or decodes it on a miss, and pairs them into pages, so no caller joins them. A
+    /// page's time is its black-frame time. A page has no visual when it lies past the credits
+    /// window, when no visual lies within 10 ms of its row, or when the ffmpeg check found the
+    /// signalstats filter missing.
     /// </remarks>
     /// <param name="episode">Media file to analyze.</param>
-    /// <param name="threshold">Threshold for black frame detection.</param>
+    /// <param name="config">The configuration the scan runs under; its black-frame threshold drives the scan and both cache rows are hashed under it.</param>
     /// <param name="cancellationToken">Token used to cancel the FFmpeg process.</param>
-    /// <returns>A task that returns the black level of each keyframe.</returns>
-    Task<BlackFrame[]> DetectBlackFramesAsync(QueuedEpisode episode, int threshold, CancellationToken cancellationToken = default);
-
-    /// <summary>
-    /// Collects per-keyframe visual statistics (entropy and saturation) for the credits fingerprint range.
-    /// </summary>
-    /// <remarks>
-    /// Normally served from the row the keyframe scan in <see cref="DetectBlackFramesAsync(QueuedEpisode, int, CancellationToken)"/>
-    /// wrote. Decodes on its own only for an episode whose black-frame row predates that shared
-    /// write, or when caching is off. Empty when the ffmpeg check found the visuals filters missing.
-    /// </remarks>
-    /// <param name="episode">Media file to analyze.</param>
-    /// <param name="cancellationToken">Token used to cancel the FFmpeg process.</param>
-    /// <returns>A task that returns per-keyframe visual statistics relative to the credits fingerprint start.</returns>
-    Task<KeyframeVisual[]> DetectKeyframeVisualsAsync(QueuedEpisode episode, CancellationToken cancellationToken = default);
+    /// <returns>A task that returns one page per keyframe, in time order, relative to the credits fingerprint start.</returns>
+    Task<KeyframePage[]> ScanKeyframesAsync(QueuedEpisode episode, PluginConfiguration config, CancellationToken cancellationToken = default);
 
     /// <summary>
     /// Finds continuous black intervals in a bounded credits range.
     /// </summary>
     /// <param name="episode">Media file to analyze.</param>
     /// <param name="range">Absolute media time range to search.</param>
-    /// <param name="threshold">Pixel threshold for black interval detection.</param>
     /// <param name="minimum">Minimum percentage of a frame that must be black for it to count as black (blackdetect pic_th); tie this to the keyframe density threshold so both definitions of "black" agree.</param>
+    /// <param name="config">The configuration the scan runs under; its black-frame threshold is the pixel threshold and its cache row is hashed under it.</param>
     /// <param name="cancellationToken">Token used to cancel the FFmpeg process.</param>
-    /// <returns>A task that returns continuous black intervals relative to the credits fingerprint start.</returns>
-    Task<BlackInterval[]> DetectBlackIntervalsAsync(QueuedEpisode episode, TimeRange range, int threshold, int minimum, CancellationToken cancellationToken = default);
+    /// <returns>A task that returns continuous black intervals, in absolute media seconds.</returns>
+    Task<BlackInterval[]> DetectBlackIntervalsAsync(QueuedEpisode episode, TimeRange range, int minimum, PluginConfiguration config, CancellationToken cancellationToken = default);
+
+    /// <summary>
+    /// Decodes every frame of a keyframe gap and reports each frame's visual, for the credits cut start.
+    /// </summary>
+    /// <remarks>
+    /// Not cached: the caller caches the start it derives. The frames are decoded at source
+    /// resolution with the keyframe scan's filters, so each frame's
+    /// <see cref="KeyframeVisual.FrameDifference"/> compares directly with a page's: both are YDIF of
+    /// the same 8-bit yuv420p frames at the same resolution. The first frame's difference is 0,
+    /// since nothing was decoded before it. Each output stream is capped at 64 MiB.
+    /// </remarks>
+    /// <param name="episode">Media file to decode.</param>
+    /// <param name="window">Absolute media time range to decode, from the keyframe before a part's first page to that page. Its start must be a keyframe from the keyframe scan: the decode seeks there, so a demuxer that seeks by timestamp, such as MPEG-TS, decodes from that keyframe rather than the next one, and the frame times fall on the scan's timeline.</param>
+    /// <param name="cancellationToken">Token used to cancel the FFmpeg process.</param>
+    /// <returns>The frames' visuals in presentation order, with times in media seconds, or <see langword="null"/> when the decode cannot be trusted: ffmpeg failed to run or exited nonzero, or its output crossed the byte cap. A frame whose block lacks a statistic is left out.</returns>
+    Task<KeyframeVisual[]?> DecodeCutWindowAsync(QueuedEpisode episode, TimeRange window, CancellationToken cancellationToken = default);
 
     /// <summary>
     /// Detects key frames in a media file within a time range.
@@ -104,9 +114,10 @@ public interface IFFmpegService
     /// <param name="episode">Media file to analyze.</param>
     /// <param name="range">Time range to search.</param>
     /// <param name="mode">Analysis mode, used to correctly key the cache entry.</param>
+    /// <param name="config">The configuration the scan runs under; its cache row is hashed under it.</param>
     /// <param name="cancellationToken">Token used to cancel the FFmpeg process.</param>
     /// <returns>A task that returns timestamps of key frames.</returns>
-    Task<double[]> DetectKeyFramesAsync(QueuedEpisode episode, TimeRange range, AnalysisMode mode, CancellationToken cancellationToken = default);
+    Task<double[]> DetectKeyFramesAsync(QueuedEpisode episode, TimeRange range, AnalysisMode mode, PluginConfiguration config, CancellationToken cancellationToken = default);
 
     /// <summary>
     /// Probes the first audio stream's actual duration with ffprobe.
@@ -115,6 +126,49 @@ public interface IFFmpegService
     /// <param name="cancellationToken">Token used to cancel the ffprobe process.</param>
     /// <returns>A task that returns the audio duration in seconds, or null when unavailable.</returns>
     Task<double?> ProbeAudioDurationAsync(string filePath, CancellationToken cancellationToken = default);
+
+    /// <summary>
+    /// Reads the chapter markers embedded in the media container with ffprobe, shaped as
+    /// Jellyfin's own probe stores them in its chapter table (<c>FFmpegOutputParser.ParseChapters</c>),
+    /// so for a file no other plugin touched both chapter sources hold the same list. While
+    /// <c>UseEmbeddedChaptersForAnalysis</c> is on, the season pass reads each episode's chapters
+    /// here once per pass, instead of from Jellyfin's chapter table, which can hold chapters
+    /// another plugin added. Nothing is cached: every call runs ffprobe.
+    /// </summary>
+    /// <param name="episode">Media file to probe.</param>
+    /// <param name="cancellationToken">Token used to cancel the ffprobe process.</param>
+    /// <returns>The chapters sorted by start, an empty array when the container has none, or
+    /// <see langword="null"/> when ffprobe could not read them: it failed to run, exited nonzero,
+    /// timed out, filled its output cap or printed JSON that does not parse.</returns>
+    Task<ChapterInfo[]?> GetEmbeddedChaptersAsync(QueuedEpisode episode, CancellationToken cancellationToken = default);
+
+    /// <summary>
+    /// Extracts timed text cues from the episode's embedded text subtitle streams and its text
+    /// subtitle sidecars.
+    /// </summary>
+    /// <remarks>
+    /// Reads only the languages of <see cref="Configuration.PluginConfiguration.SubtitleLanguages"/>,
+    /// and only codecs that ffmpeg decodes to text; image subtitles would need OCR. Runs ffprobe
+    /// once to list the embedded streams, then ffmpeg once for all of them, since every run
+    /// demuxes the file, and once per sidecar. The embedded run reads only around
+    /// <paramref name="window"/>: it seeks to shortly before the window when the window starts
+    /// later than that, and stops shortly after it when the window ends before
+    /// <see cref="QueuedEpisode.Duration"/>. Sidecars are small and read whole. A sidecar that
+    /// is neither valid UTF-8 nor marked by a byte order mark is decoded with its detected
+    /// charset into a UTF-8 copy, which ffmpeg reads instead. Each run writes WebVTT files to a
+    /// directory below Jellyfin's temp directory that is deleted before the call returns. A
+    /// failed probe or ffmpeg run is logged and marks the scan incomplete instead of throwing.
+    /// The other runs are still read, and so are the outputs of the failed run, which stop
+    /// where the run did. A failed file operation (listing or reading the sidecars, creating
+    /// the output directory, reading an output) is logged too and ends the scan with the cues
+    /// read so far, incomplete. Each episode's subtitle output is capped, split evenly across
+    /// its streams; a stream that reaches its share is dropped and the scan is incomplete.
+    /// </remarks>
+    /// <param name="episode">Media file whose subtitles should be read.</param>
+    /// <param name="window">The media seconds in which the caller needs every cue that starts. Cues outside it may be returned too.</param>
+    /// <param name="cancellationToken">Token used to cancel subtitle extraction.</param>
+    /// <returns>The cues of every source that could be read, with every cue a full read finds starting inside <paramref name="window"/>, and whether all of them were read.</returns>
+    Task<SubtitleScan> ExtractSubtitleCuesAsync(QueuedEpisode episode, TimeRange window, CancellationToken cancellationToken = default);
 
     /// <summary>
     /// Gets the outcome of the most recent <see cref="CheckFFmpegVersionAsync"/> run for the support bundle.

@@ -85,27 +85,6 @@ internal static class SeasonReanalysisPlanner
     }
 
     /// <summary>
-    /// Adds Preview to a reset that includes Credits when anime previews are derived from the
-    /// credits end, so the derived segments are regenerated with their source.
-    /// </summary>
-    /// <param name="modes">The modes selected for reset.</param>
-    /// <param name="animePreviewFromCreditsEnd">The <see cref="PluginConfiguration.AnimePreviewFromCreditsEnd"/> setting.</param>
-    /// <returns>The modes to reset, with Preview appended when it is derived from Credits.</returns>
-    internal static IReadOnlyCollection<AnalysisMode> ExpandSettledResetModesForDerivedSegments(
-        IReadOnlyList<AnalysisMode> modes,
-        bool animePreviewFromCreditsEnd)
-    {
-        if (!animePreviewFromCreditsEnd ||
-            !modes.Contains(AnalysisMode.Credits) ||
-            modes.Contains(AnalysisMode.Preview))
-        {
-            return modes;
-        }
-
-        return [.. modes, AnalysisMode.Preview];
-    }
-
-    /// <summary>
     /// Returns whether a settle re-analysis of the mode would actually run an analyzer: Introduction
     /// needs Chromaprint unless the season is pinned to the chapter analyzer.
     /// </summary>
@@ -113,18 +92,18 @@ internal static class SeasonReanalysisPlanner
     /// <param name="action">The season's analyzer action for the mode.</param>
     /// <param name="ffmpegValid">Whether FFmpeg supports Chromaprint.</param>
     /// <returns><see langword="true"/> when the mode can be re-analyzed; otherwise <see langword="false"/>.</returns>
-    internal static bool CanSettleReanalysisRun(AnalysisMode mode, AnalyzerAction action, bool ffmpegValid)
+    private static bool CanSettleReanalysisRun(AnalysisMode mode, AnalyzerAction action, bool ffmpegValid)
         => mode != AnalysisMode.Introduction || ffmpegValid || action == AnalyzerAction.Chapter;
 
     /// <summary>
     /// Returns whether a mode's recorded settle-reanalysis episode set differs from the current one.
-    /// The record is written by <c>IIntroSkipperDatabase.RecordSettleReanalysisAsync</c> only after
-    /// the reset succeeded, so the decision survives plugin restarts.
+    /// The record is written by <c>IntroSkipperDatabase.RecordSettleReanalysisAsync</c> only after
+    /// the mode's reanalysis completed, so an interrupted reanalysis runs again.
     /// </summary>
     /// <param name="settledEpisodeIds">Episode IDs recorded when the season was last settle-reanalyzed for this mode.</param>
     /// <param name="episodeIds">Current episode IDs in the season.</param>
     /// <returns><see langword="true"/> when a re-analysis should be performed; otherwise <see langword="false"/>.</returns>
-    internal static bool ShouldSettleReanalyze(
+    private static bool ShouldSettleReanalyze(
         IReadOnlySet<Guid> settledEpisodeIds,
         IReadOnlyCollection<Guid> episodeIds)
         => settledEpisodeIds.Count != episodeIds.Count || episodeIds.Any(id => !settledEpisodeIds.Contains(id));

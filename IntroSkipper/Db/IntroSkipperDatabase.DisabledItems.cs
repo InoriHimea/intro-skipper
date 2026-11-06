@@ -10,17 +10,29 @@ namespace IntroSkipper.Db;
 /// Disabled-item operations of <see cref="IntroSkipperDatabase"/>: items whose
 /// automatic segments are withheld from Jellyfin.
 /// </summary>
-internal sealed partial class IntroSkipperDatabase
+public sealed partial class IntroSkipperDatabase
 {
-    /// <inheritdoc/>
-    public async Task<IReadOnlySet<Guid>> GetDisabledItemIdsAsync(Guid seasonId, CancellationToken cancellationToken = default)
+    /// <summary>
+    /// Returns the IDs among the given items whose automatic segments are withheld
+    /// from Jellyfin.
+    /// </summary>
+    /// <param name="itemIds">Item IDs to check.</param>
+    /// <param name="cancellationToken">Cancellation token.</param>
+    /// <returns>The disabled item IDs.</returns>
+    public async Task<IReadOnlySet<Guid>> GetDisabledItemIdsAsync(IEnumerable<Guid> itemIds, CancellationToken cancellationToken = default)
     {
+        var ids = itemIds.Distinct().ToArray();
+        if (ids.Length == 0)
+        {
+            return new HashSet<Guid>();
+        }
+
         await InitializeAsync().ConfigureAwait(false);
         using var db = _contextFactory.CreateDbContext();
 
         return await db.DisabledItems
             .AsNoTracking()
-            .Where(e => e.SeasonId == seasonId)
+            .Where(e => EF.Parameter(ids).Contains(e.ItemId))
             .Select(e => e.ItemId)
             .ToHashSetAsync(cancellationToken)
             .ConfigureAwait(false);
@@ -28,50 +40,32 @@ internal sealed partial class IntroSkipperDatabase
 
     /// <summary>
     /// Sets whether the item's automatic segments are withheld from Jellyfin, on a
-    /// caller-owned context: disabling rewrites a stale season key in place
-    /// (<paramref name="seasonId"/> is the season-state key, a movie's own ID for
-    /// movies), idempotent requests stage nothing. Stages the flag change without
-    /// saving; the caller saves and commits when <c>Changed</c> is set.
+    /// caller-owned context. Stages the flag change without saving; the caller saves
+    /// and commits when this answers <see langword="true"/>. An idempotent request
+    /// stages nothing and answers <see langword="false"/>.
     /// </summary>
-    private static async Task<(bool Previous, bool Changed)> SetItemDisabledCoreAsync(
-        IntroSkipperDbContext db,
-        Guid seasonId,
-        Guid itemId,
-        bool disabled,
-        CancellationToken cancellationToken)
+    private static async Task<bool> SetItemDisabledCoreAsync(IntroSkipperDbContext db, Guid itemId, bool disabled, CancellationToken cancellationToken)
     {
         var existing = await db.DisabledItems
             .FindAsync([itemId], cancellationToken)
             .ConfigureAwait(false);
-        var previous = existing is not null;
+        if (existing is null)
+        {
+            if (!disabled)
+            {
+                return false;
+            }
+
+            db.DisabledItems.Add(new DbDisabledItem(itemId));
+            return true;
+        }
 
         if (disabled)
         {
-            if (existing is null)
-            {
-                db.DisabledItems.Add(new DbDisabledItem(seasonId, itemId));
-            }
-            else if (existing.SeasonId == seasonId)
-            {
-                return (previous, false);
-            }
-            else
-            {
-                // The item moved season keys since it was disabled; the flag
-                // follows the item, so rewrite the stale key in place.
-                existing.SeasonId = seasonId;
-            }
-        }
-        else
-        {
-            if (existing is null)
-            {
-                return (previous, false);
-            }
-
-            db.DisabledItems.Remove(existing);
+            return false;
         }
 
-        return (previous, true);
+        db.DisabledItems.Remove(existing);
+        return true;
     }
 }

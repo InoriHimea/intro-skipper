@@ -25,25 +25,52 @@ internal static class CommunityHashAdoption
     /// <param name="database">Segment database facade.</param>
     /// <param name="snapshot">The season's stored analysis state.</param>
     /// <param name="config">Plugin configuration.</param>
+    /// <param name="analysisPercentOverride">Season-level percentage override.</param>
+    /// <param name="analysisLengthLimitOverride">Season-level runtime limit override.</param>
+    /// <param name="previewFromCreditsEndOverride">Effective season preview derivation setting.</param>
     /// <param name="cancellationToken">Cancellation token.</param>
     /// <returns><see langword="true"/> when any record was updated.</returns>
     internal static async Task<bool> UpgradeAsync(
-        IIntroSkipperDatabase database,
+        IntroSkipperDatabase database,
         SeasonQueueSnapshot snapshot,
         PluginConfiguration config,
+        int? analysisPercentOverride = null,
+        int? analysisLengthLimitOverride = null,
+        bool? previewFromCreditsEndOverride = null,
         CancellationToken cancellationToken = default)
     {
         var updated = false;
         foreach (var mode in new[] { AnalysisMode.Introduction, AnalysisMode.Credits })
         {
             var action = snapshot.AnalyzerActionByMode.GetValueOrDefault(mode, AnalyzerAction.Default);
-            foreach (var ffmpegValid in new[] { false, true })
+            foreach (var (ffmpegValid, chapterSource) in new[]
             {
-                var currentHash = ConfigHasher.Analysis(config, mode, action, ffmpegValid);
-                var previousHash = ConfigHasher.Analysis(config, mode, action, ffmpegValid, !config.EnableCommunityFallback);
-                var candidates = snapshot.AnalyzedConfigHashes
+                (false, ChapterSource.JellyfinTable), (true, ChapterSource.JellyfinTable),
+                (false, ChapterSource.Embedded), (true, ChapterSource.Embedded)
+            })
+            {
+                var currentHash = ConfigHasher.Analysis(
+                    config,
+                    mode,
+                    action,
+                    ffmpegValid,
+                    analysisPercentOverride,
+                    analysisLengthLimitOverride,
+                    previewFromCreditsEndOverride,
+                    chapterSource: chapterSource);
+                var previousHash = ConfigHasher.Analysis(
+                    config,
+                    mode,
+                    action,
+                    ffmpegValid,
+                    analysisPercentOverride,
+                    analysisLengthLimitOverride,
+                    previewFromCreditsEndOverride,
+                    chapterSource: chapterSource,
+                    communityFallback: !config.EnableCommunityFallback);
+                var candidates = snapshot.AnalysisRecords
                     .Where(pair => pair.Key.Mode == mode
-                        && string.Equals(pair.Value, previousHash, StringComparison.Ordinal)
+                        && string.Equals(pair.Value.ConfigHash, previousHash, StringComparison.Ordinal)
                         && snapshot.SegmentModesByEpisodeId.TryGetValue(pair.Key.ItemId, out var modes)
                         && modes.Contains(mode))
                     .Select(pair => pair.Key.ItemId)

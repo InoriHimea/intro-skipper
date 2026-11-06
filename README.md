@@ -1,7 +1,7 @@
 # Intro Skipper — Inori fork
 
 > [!IMPORTANT]
-> **这是非官方维护分支，不是上游发布包。** 基于上游 `12.0/v12.0.4.0`，包含两项补丁：
+> **这是非官方维护分支，不是上游发布包。** 已同步上游 `12.0` 分支至 `223a086`（包含 `12.0/v12.0.6.0` 及其后续更新），包含两项补丁：
 >
 > 1. **片尾保留缓冲**：设置 `IntroEndOffset=5` 且媒体时长已知时，播放 API 返回的片尾跳转终点不晚于媒体结束前 5 秒；已有更长间隙不延长。不改检测结果、数据库或分析 hash。
 > 2. **社区时间点补充**（默认关闭）：本地分析找不到片头/片尾时，从 IntroDB、TheIntroDB 补充，并照常应用偏移设置。本地结果始终优先；关闭时分析 hash 不变。
@@ -13,7 +13,7 @@
 - [本 fork 的版本发布](https://github.com/InoriHimea/intro-skipper/releases)
 - [上游原始项目](https://github.com/intro-skipper/intro-skipper)
 
-补丁发行标签独立于程序集版本，例如 `12.0/v12.0.4.0-inori-tail5s.1`；DLL 仍为 `IntroSkipper.dll`、程序集/文件版本仍为 `12.0.4.0`。请按 Release 标签、源码提交和 SHA256 区分本地补丁与同版本官方 DLL。下方保留上游介绍、署名和许可；其中上游徽章、签名和 manifest 不代表本 fork 的验证或签名，官方 manifest 也不会安装本补丁。
+补丁发行标签独立于程序集版本；历史发行例如 `12.0/v12.0.4.0-inori-tail5s.1`。当前源码生成的 DLL 仍为 `IntroSkipper.dll`，程序集/文件版本随上游更新为 `12.0.6.0`。请按 Release 标签、源码提交和 SHA256 区分本地补丁与同版本官方 DLL。下方保留上游介绍、署名和许可；其中上游徽章、签名和 manifest 不代表本 fork 的验证或签名，官方 manifest 也不会安装本补丁。
 
 ## 上游项目说明
 
@@ -125,7 +125,7 @@ their respective owners.
 
 Companies that kindly allow us to use their stuff:
 
-| [DigitalOcean](https://www.digitalocean.com/?refcode=8471e96eb6dd)                                                                                                                                                                                                                           | [SignPath](https://signpath.org/)                                                                                  |
-|-|-
-| [![do_logo_vertical_blue svg](https://opensource.nyc3.cdn.digitaloceanspaces.com/attribution/assets/SVG/DO_Logo_horizontal_blue.svg)](https://www.digitalocean.com/) | [ ![Image](https://github.com/user-attachments/assets/2b5679e0-76a4-4ae7-bb37-a6a507a53466)](https://signpath.org/) |
-| Hosting of various services                                                                                                                                                                                                                                               | Free code signing provided by [SignPath.io](https://about.signpath.io/), certificate by [SignPath Foundation](https://signpath.org/).  
+| [SignPath](https://signpath.org/) | [Fyra Stack](https://fyrastack.com/) |
+|-|-|
+| [ ![Image](https://github.com/user-attachments/assets/2b5679e0-76a4-4ae7-bb37-a6a507a53466)](https://signpath.org/) | [![Fyra Stack](https://raw.githubusercontent.com/FyraLabs/branding/logos/badges/stack-badge-animated.webp)](https://fyrastack.com/) |
+| Free code signing provided by [SignPath.io](https://about.signpath.io/), certificate by [SignPath Foundation](https://signpath.org/).  | Infrastructure provided by [Fyra Stack](https://fyrastack.com/) from [Fyra Labs](https://fyralabs.com/). |

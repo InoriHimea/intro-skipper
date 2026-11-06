@@ -2,6 +2,7 @@
 // SPDX-FileCopyrightText: 2026 AbandonedCart
 // SPDX-License-Identifier: GPL-3.0-only
 
+using System.Linq.Expressions;
 using IntroSkipper.Data;
 using Microsoft.EntityFrameworkCore;
 
@@ -11,9 +12,15 @@ namespace IntroSkipper.Db;
 /// Bulk maintenance operations of <see cref="IntroSkipperDatabase"/> spanning
 /// segments, analysis records and season state.
 /// </summary>
-internal sealed partial class IntroSkipperDatabase
+public sealed partial class IntroSkipperDatabase
 {
-    /// <inheritdoc/>
+    /// <summary>
+    /// Gets the IDs of items with segments (including tombstones) that are no longer
+    /// part of any enabled library.
+    /// </summary>
+    /// <param name="enabledEpisodeIds">Episode IDs that are still part of enabled libraries.</param>
+    /// <param name="cancellationToken">Cancellation token.</param>
+    /// <returns>The stale episode IDs.</returns>
     public async Task<IReadOnlyCollection<Guid>> GetStaleTimestampEpisodeIdsAsync(
         IEnumerable<Guid> enabledEpisodeIds,
         CancellationToken cancellationToken = default)
@@ -34,7 +41,19 @@ internal sealed partial class IntroSkipperDatabase
             .ConfigureAwait(false);
     }
 
-    /// <inheritdoc/>
+    /// <summary>
+    /// Removes the pass's stale automatic segments for the supplied items: active rows
+    /// whose <see cref="DbSegment.ConfigHash"/> is non-empty and differs from
+    /// <paramref name="configHash"/>. Credits-derived rows belong to the credits pass.
+    /// User segments, tombstones, rows with an empty hash and the automatic rows of a
+    /// type the item holds an active user row for are kept. The affected items'
+    /// projections are journaled with the delete.
+    /// </summary>
+    /// <param name="itemIds">Item IDs to inspect.</param>
+    /// <param name="mode">Analysis mode.</param>
+    /// <param name="configHash">Current configuration hash.</param>
+    /// <param name="cancellationToken">Cancellation token.</param>
+    /// <returns>The number of rows removed.</returns>
     public async Task<int> CleanStaleAutomaticSegmentsAsync(
         IEnumerable<Guid> itemIds,
         AnalysisMode mode,
@@ -76,7 +95,7 @@ internal sealed partial class IntroSkipperDatabase
         var transaction = await db.Database.BeginTransactionAsync(cancellationToken).ConfigureAwait(false);
         await using (transaction.ConfigureAwait(false))
         {
-            // Journaled with the delete; see docs/segment-database-v2.md.
+            // Journaled with the delete; see docs/segments.md.
             var (removed, _) = await DeleteSegmentsAndJournalAsync(db, staleRows, cancellationToken).ConfigureAwait(false);
             await db.SaveChangesAsync(cancellationToken).ConfigureAwait(false);
             await transaction.CommitAsync(cancellationToken).ConfigureAwait(false);
@@ -84,8 +103,47 @@ internal sealed partial class IntroSkipperDatabase
         }
     }
 
-    /// <inheritdoc/>
-    public async Task<int> EraseItemsAsync(IReadOnlyCollection<Guid> itemIds, CancellationToken cancellationToken = default)
+    /// <summary>
+    /// Erases the supplied items' automatic segments and every analysis record of the
+    /// items, in one transaction with every item's projection journaled, items without
+    /// rows included.
+    /// </summary>
+    /// <remarks>
+    /// User segments stay, because analysis did not create them. They settle their modes,
+    /// so the next pass analyzes only the item's other modes. Tombstones go only when
+    /// <paramref name="eraseTombstones"/> is set. Season state and disable flags are
+    /// untouched. The ID set is bound as one JSON parameter, so the item count is
+    /// unbounded. <see cref="ForgetItemsAsync"/> deletes user segments too, for items the
+    /// server no longer knows.
+    /// </remarks>
+    /// <param name="itemIds">Item IDs to erase.</param>
+    /// <param name="eraseTombstones"><see langword="true"/> to delete the items' tombstones too, so detection may add the deleted ranges again; otherwise, <see langword="false"/>, and the tombstones keep refusing re-detections.</param>
+    /// <param name="cancellationToken">Cancellation token.</param>
+    /// <returns>The number of deleted segment rows: automatic segments, plus tombstones when <paramref name="eraseTombstones"/> is set.</returns>
+    public Task<int> EraseItemsAsync(IReadOnlyCollection<Guid> itemIds, bool eraseTombstones, CancellationToken cancellationToken = default)
+        => DeleteItemsAsync(
+            itemIds,
+            s => s.Source != SegmentSource.User && (eraseTombstones || s.State == SegmentState.Active),
+            cancellationToken);
+
+    /// <summary>
+    /// Deletes every segment row of the supplied items, user segments and tombstones
+    /// included, and every analysis record of the items, in one transaction with every
+    /// item's projection journaled. Only for items the server no longer knows: an item
+    /// that still exists keeps its user segments through <see cref="EraseItemsAsync"/>.
+    /// </summary>
+    /// <param name="itemIds">IDs of items the server no longer knows.</param>
+    /// <param name="cancellationToken">Cancellation token.</param>
+    /// <returns>The number of deleted segment rows.</returns>
+    public Task<int> ForgetItemsAsync(IReadOnlyCollection<Guid> itemIds, CancellationToken cancellationToken = default)
+        => DeleteItemsAsync(itemIds, static _ => true, cancellationToken);
+
+    /// <summary>
+    /// Deletes the items' segment rows that match <paramref name="doomedRows"/> and every
+    /// analysis record of the items, and journals every item's projection, in one
+    /// transaction.
+    /// </summary>
+    private async Task<int> DeleteItemsAsync(IReadOnlyCollection<Guid> itemIds, Expression<Func<DbSegment, bool>> doomedRows, CancellationToken cancellationToken)
     {
         var ids = itemIds.Distinct().ToArray();
         if (ids.Length == 0)
@@ -99,13 +157,14 @@ internal sealed partial class IntroSkipperDatabase
         var transaction = await db.Database.BeginTransactionAsync(cancellationToken).ConfigureAwait(false);
         await using (transaction.ConfigureAwait(false))
         {
-            // Journal every addressed item, rows or not: an erase is the user saying
-            // "this item must serve nothing", and an item with zero plugin rows can
-            // still hold ghost Jellyfin rows (a past projection whose plugin rows were
-            // since lost) that only a projection heals. Erases are explicit user
-            // actions over bounded id sets, so the extra markers cost one no-op sync each.
+            // Journal every addressed item, rows deleted or not. An item can hold ghost
+            // Jellyfin rows (a past projection whose plugin rows were since lost) that
+            // only a projection heals, and Jellyfin clears the mirror of an item whose
+            // file changed right after the provider's erase, so its kept user segments
+            // need a push back. The extra markers cost one no-op sync each.
             var removedSegments = await db.Segments
                 .Where(s => EF.Parameter(ids).Contains(s.ItemId))
+                .Where(doomedRows)
                 .ExecuteDeleteAsync(cancellationToken)
                 .ConfigureAwait(false);
             await db.AnalyzedItems
@@ -119,14 +178,51 @@ internal sealed partial class IntroSkipperDatabase
         }
     }
 
-    /// <inheritdoc/>
-    public async Task ResetItemsForReanalysisAsync(
+    /// <summary>
+    /// Clears the items' automatic segments and analysis records for the modes in one
+    /// transaction so the current pass re-analyzes them from scratch. User segments,
+    /// tombstones and the automatic rows of a type the item holds an active user row
+    /// for are kept. Subtitle rows of <paramref name="preserveSubtitleModes"/> also stay,
+    /// as the fallback until the subtitle pass replaces or retires them. Items whose rows
+    /// were deleted journal their projections with the reset.
+    /// </summary>
+    /// <param name="itemIds">Item IDs to reset.</param>
+    /// <param name="modes">Analysis modes to reset.</param>
+    /// <param name="preserveSubtitleModes">Modes whose subtitle rows stay, or <see langword="null"/> for none.</param>
+    /// <param name="cancellationToken">Cancellation token.</param>
+    /// <returns>A <see cref="Task"/> representing the asynchronous operation.</returns>
+    public Task ResetItemsForReanalysisAsync(
         IEnumerable<Guid> itemIds,
         IReadOnlyCollection<AnalysisMode> modes,
+        IReadOnlyCollection<AnalysisMode>? preserveSubtitleModes = null,
+        CancellationToken cancellationToken = default)
+        => ResetItemsForReanalysisAsync(
+            itemIds,
+            modes,
+            preserveSubtitleModes,
+            preserveAutomaticModes: [],
+            cancellationToken: cancellationToken);
+
+    /// <summary>
+    /// Resets analysis records and automatic rows, optionally retaining selected automatic
+    /// rows as fallbacks while a mode is reanalyzed.
+    /// </summary>
+    /// <param name="itemIds">Item IDs to reset.</param>
+    /// <param name="modes">Analysis modes to reset.</param>
+    /// <param name="preserveSubtitleModes">Modes whose subtitle rows stay until the subtitle pass completes.</param>
+    /// <param name="preserveAutomaticModes">Modes whose automatic rows stay as fallbacks until their analyzer succeeds.</param>
+    /// <param name="cancellationToken">Cancellation token.</param>
+    /// <returns>A <see cref="Task"/> representing the asynchronous operation.</returns>
+    internal async Task ResetItemsForReanalysisAsync(
+        IEnumerable<Guid> itemIds,
+        IReadOnlyCollection<AnalysisMode> modes,
+        IReadOnlyCollection<AnalysisMode>? preserveSubtitleModes,
+        IReadOnlyCollection<AnalysisMode> preserveAutomaticModes,
         CancellationToken cancellationToken = default)
     {
         var ids = itemIds.Distinct().ToArray();
         var modeArray = modes.ToArray();
+        var preserveAutoModes = preserveAutomaticModes.ToArray();
         if (ids.Length == 0 || modeArray.Length == 0)
         {
             return;
@@ -148,7 +244,18 @@ internal sealed partial class IntroSkipperDatabase
                         && u.Source == SegmentSource.User
                         && u.State == SegmentState.Active));
 
-            // Journaled with the delete; see docs/segment-database-v2.md.
+            if (preserveAutoModes.Length > 0)
+            {
+                doomedRows = doomedRows.Where(s => !preserveAutoModes.Contains(s.Type));
+            }
+
+            if (preserveSubtitleModes is { Count: > 0 })
+            {
+                var subtitleModes = preserveSubtitleModes.ToArray();
+                doomedRows = doomedRows.Where(s => s.Source != SegmentSource.Subtitle || !subtitleModes.Contains(s.Type));
+            }
+
+            // Journaled with the delete; see docs/segments.md.
             await DeleteSegmentsAndJournalAsync(db, doomedRows, cancellationToken).ConfigureAwait(false);
 
             // Without their records the items are NotAnalyzed on this pass (or a later
@@ -162,7 +269,14 @@ internal sealed partial class IntroSkipperDatabase
         }
     }
 
-    /// <inheritdoc/>
+    /// <summary>
+    /// Gets the season-state keys that are not part of <paramref name="retainedSeasonIds"/>,
+    /// so cleanup can decide per key whether the season is gone or merely missing from an
+    /// enumeration that skipped its library.
+    /// </summary>
+    /// <param name="retainedSeasonIds">Season IDs known to still exist.</param>
+    /// <param name="cancellationToken">Cancellation token.</param>
+    /// <returns>The stale season-state keys.</returns>
     public async Task<IReadOnlyCollection<Guid>> GetStaleSeasonIdsAsync(IEnumerable<Guid> retainedSeasonIds, CancellationToken cancellationToken = default)
     {
         var retainedIds = retainedSeasonIds.Distinct().ToArray();
@@ -173,12 +287,22 @@ internal sealed partial class IntroSkipperDatabase
         return await db.SeasonStates
             .Where(s => !EF.Parameter(retainedIds).Contains(s.SeasonId))
             .Select(s => s.SeasonId)
+            .Union(db.SeasonAnalysisOverrides
+                .Where(s => !EF.Parameter(retainedIds).Contains(s.SeasonId))
+                .Select(s => s.SeasonId))
             .Distinct()
             .ToArrayAsync(cancellationToken)
             .ConfigureAwait(false);
     }
 
-    /// <inheritdoc/>
+    /// <summary>
+    /// Gets the item IDs holding per-item state (disable flags or analysis records) that
+    /// are not part of <paramref name="retainedItemIds"/>, so cleanup can decide per item
+    /// whether it is gone or merely missing from an enumeration that skipped its library.
+    /// </summary>
+    /// <param name="retainedItemIds">Item IDs known to still exist.</param>
+    /// <param name="cancellationToken">Cancellation token.</param>
+    /// <returns>The stale per-item-state item IDs.</returns>
     public async Task<IReadOnlyCollection<Guid>> GetStaleItemStateIdsAsync(IReadOnlyCollection<Guid> retainedItemIds, CancellationToken cancellationToken = default)
     {
         var retainedIds = retainedItemIds.Distinct().ToArray();
@@ -197,7 +321,12 @@ internal sealed partial class IntroSkipperDatabase
             .ConfigureAwait(false);
     }
 
-    /// <inheritdoc/>
+    /// <summary>
+    /// Removes season-state rows whose seasons no longer exist.
+    /// </summary>
+    /// <param name="seasonIds">Season IDs that still exist.</param>
+    /// <param name="cancellationToken">Cancellation token.</param>
+    /// <returns>A <see cref="Task"/> representing the asynchronous operation.</returns>
     public async Task CleanSeasonStateAsync(IEnumerable<Guid> seasonIds, CancellationToken cancellationToken = default)
     {
         var retainedIds = seasonIds.Distinct().ToArray();
@@ -211,9 +340,19 @@ internal sealed partial class IntroSkipperDatabase
             .Where(s => !EF.Parameter(retainedIds).Contains(s.SeasonId))
             .ExecuteDeleteAsync(cancellationToken)
             .ConfigureAwait(false);
+        await db.SeasonAnalysisOverrides
+            .Where(s => !EF.Parameter(retainedIds).Contains(s.SeasonId))
+            .ExecuteDeleteAsync(cancellationToken)
+            .ConfigureAwait(false);
     }
 
-    /// <inheritdoc/>
+    /// <summary>
+    /// Removes per-item state (disable flags and analysis records) of items that no
+    /// longer exist in enabled libraries.
+    /// </summary>
+    /// <param name="retainedItemIds">Item IDs that still exist.</param>
+    /// <param name="cancellationToken">Cancellation token.</param>
+    /// <returns>A <see cref="Task"/> representing the asynchronous operation.</returns>
     public async Task CleanItemStateAsync(IReadOnlyCollection<Guid> retainedItemIds, CancellationToken cancellationToken = default)
     {
         var retainedIds = retainedItemIds.Distinct().ToArray();
@@ -221,10 +360,8 @@ internal sealed partial class IntroSkipperDatabase
         await InitializeAsync().ConfigureAwait(false);
         using var db = _contextFactory.CreateDbContext();
 
-        // Both tables are pruned by item ID, never by a season key: the disable row's key
-        // is mutable metadata that goes stale when an item moves season keys, so the flag
-        // must follow the item. EF.Parameter binds the retained set as one JSON
-        // parameter, so this is safe for arbitrarily large libraries.
+        // EF.Parameter binds the retained set as one JSON parameter, so this is safe for
+        // arbitrarily large libraries.
         await db.DisabledItems
             .Where(e => !EF.Parameter(retainedIds).Contains(e.ItemId))
             .ExecuteDeleteAsync(cancellationToken)

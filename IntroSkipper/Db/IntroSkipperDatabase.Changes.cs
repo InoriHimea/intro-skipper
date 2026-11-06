@@ -1,9 +1,12 @@
 // SPDX-FileCopyrightText: 2026 rlauuzo
+// SPDX-FileCopyrightText: 2026 AbandonedCart
+// SPDX-FileCopyrightText: 2026 mani
 // SPDX-License-Identifier: GPL-3.0-only
 
 using IntroSkipper.Data;
 using IntroSkipper.SegmentChanges;
 using Jellyfin.Database.Implementations.Enums;
+using MediaBrowser.Model.MediaSegments;
 using Microsoft.EntityFrameworkCore;
 
 namespace IntroSkipper.Db;
@@ -16,7 +19,7 @@ namespace IntroSkipper.Db;
 /// crash. The journal records work, not data — projection re-derives the item's image
 /// from current truth when it runs.
 /// </summary>
-internal sealed partial class IntroSkipperDatabase
+public sealed partial class IntroSkipperDatabase
 {
     /// <summary>
     /// Rows mirrored before the shared-id scheme were converted from seconds by
@@ -26,8 +29,24 @@ internal sealed partial class IntroSkipperDatabase
     /// </summary>
     internal const long UncorrelatedTickTolerance = 1;
 
-    /// <inheritdoc/>
-    public async Task<MutationResult> ApplyChangeAsync(SegmentChangeIntent intent, Func<Task<ExternalSegmentTarget?>>? resolveExternalTarget = null, CancellationToken cancellationToken = default)
+    /// <summary>
+    /// Applies one closed segment-change intent in a single transaction: the mutation,
+    /// its analysis-record bookkeeping and the projection journal. Rejected intents
+    /// journal nothing; ignored (already held) intents still journal a re-projection
+    /// unless their target exists in no state at all. Callers must serialize calls
+    /// per item (the coordinator's mutation stripe): concurrent first-time enqueues
+    /// for one item can otherwise fail on the queue's primary key. Outcome semantics:
+    /// <c>docs/segments.md</c>.
+    /// </summary>
+    /// <param name="intent">Closed domain intent.</param>
+    /// <param name="resolveExternalTarget">Resolves the Jellyfin row an
+    /// <see cref="EditorDeleteSegmentIntent"/> addresses; invoked at most once, inside
+    /// the transaction, only after the correlated lookup misses. Ignored for other
+    /// intents.</param>
+    /// <param name="cancellationToken">Cancellation token.</param>
+    /// <returns>The mutation outcome; <see cref="MutationResult.Outcome"/> is
+    /// <see langword="null"/> when the change committed.</returns>
+    public async Task<MutationResult> ApplyChangeAsync(SegmentChangeIntent intent, Func<Task<(MediaSegmentDto Segment, bool IsOwn)?>>? resolveExternalTarget = null, CancellationToken cancellationToken = default)
     {
         ArgumentNullException.ThrowIfNull(intent);
         if (Validate(intent) is { } rejection)
@@ -40,6 +59,17 @@ internal sealed partial class IntroSkipperDatabase
         var transaction = await db.Database.BeginTransactionAsync(cancellationToken).ConfigureAwait(false);
         await using (transaction.ConfigureAwait(false))
         {
+            if (intent is ReplaceUserSegmentsForItemIntent { ExpectedRevision: { } expectedRevision } && expectedRevision != "*")
+            {
+                var currentRevision = await ComputeSegmentRevisionAsync(db, intent.ItemId, cancellationToken).ConfigureAwait(false);
+                if (!string.Equals(currentRevision, expectedRevision, StringComparison.Ordinal))
+                {
+                    return MutationResult.Reject(
+                        SegmentChangeRejectedReason.RevisionMismatch,
+                        "The segment image has changed since it was read.");
+                }
+            }
+
             var result = await MutateAsync(db, intent, resolveExternalTarget, cancellationToken).ConfigureAwait(false);
             if (result.Outcome is Rejected || !result.Reproject)
             {
@@ -50,6 +80,14 @@ internal sealed partial class IntroSkipperDatabase
                 return result;
             }
 
+            // A preview derived from the old credits end would otherwise stay: an edited
+            // Credits mode settles as user-provided and never reruns its derive. A
+            // visibility change lists every visible row but changes no credits.
+            if (intent is not SegmentVisibilityChangeIntent && result.Affected.Any(value => value.Mode == AnalysisMode.Credits))
+            {
+                await ClearItemAnalysisCoreAsync(db, intent.ItemId, AnalysisMode.Preview, cancellationToken).ConfigureAwait(false);
+            }
+
             // Accepted and Ignored both journal: an Ignored intent re-asserts state
             // the plugin database already holds, and re-projecting that state is how
             // a diverged mirror (a ghost or missing Jellyfin row) heals when the
@@ -57,9 +95,24 @@ internal sealed partial class IntroSkipperDatabase
             // same reason.
             await EnqueueProjectionAsync(db, intent.ItemId, cancellationToken).ConfigureAwait(false);
             await db.SaveChangesAsync(cancellationToken).ConfigureAwait(false);
+            var revision = intent is ReplaceUserSegmentsForItemIntent
+                ? await ComputeSegmentRevisionAsync(db, intent.ItemId, cancellationToken).ConfigureAwait(false)
+                : null;
             await transaction.CommitAsync(cancellationToken).ConfigureAwait(false);
-            return result;
+            return result with { Revision = revision };
         }
+    }
+
+    private static async Task<string> ComputeSegmentRevisionAsync(
+        IntroSkipperDbContext db,
+        Guid itemId,
+        CancellationToken cancellationToken)
+    {
+        var rows = await db.Segments.AsNoTracking()
+            .Where(s => s.ItemId == itemId)
+            .ToListAsync(cancellationToken)
+            .ConfigureAwait(false);
+        return SegmentRevision.Compute(rows);
     }
 
     /// <summary>
@@ -74,12 +127,16 @@ internal sealed partial class IntroSkipperDatabase
 
     /// <summary>
     /// The single home of the marker-supersession rule, shared by the intent path
-    /// (one item) and the bulk analysis/maintenance writes: an existing marker bumps
-    /// its version with the due time reset, a missing one inserts. Runs inside the
-    /// caller's transaction; the projection worker's poll picks the markers up, so
-    /// bulk writers never await Jellyfin.
+    /// (one item), the bulk analysis/maintenance writes and the legacy import: an
+    /// existing marker bumps its version with the due time reset, a missing one
+    /// inserts. Runs inside the caller's transaction; the projection worker's poll
+    /// picks the markers up, so bulk writers never await Jellyfin.
     /// </summary>
-    private static async Task EnqueueProjectionsAsync(IntroSkipperDbContext db, IReadOnlyCollection<Guid> itemIds, CancellationToken cancellationToken)
+    /// <param name="db">Open context whose transaction the upsert joins.</param>
+    /// <param name="itemIds">Items whose projection is behind; duplicates collapse.</param>
+    /// <param name="cancellationToken">Cancellation token.</param>
+    /// <returns>A task that completes when the markers are written.</returns>
+    internal static async Task EnqueueProjectionsAsync(IntroSkipperDbContext db, IReadOnlyCollection<Guid> itemIds, CancellationToken cancellationToken)
     {
         // Atomic multi-row upserts, never a tracked read-modify-write: the analyzer
         // and maintenance callers hold no projection stripe, so the worker's
@@ -153,13 +210,16 @@ internal sealed partial class IntroSkipperDatabase
         {
             AddUserSegmentIntent value when !ValidMode(value.Mode) || !TickConversions.IsValidTickRange(value.StartTicks, value.EndTicks) => new(SegmentChangeRejectedReason.InvalidModeOrRange, "Invalid mode or tick range."),
             ReplaceUserSegmentsForModeIntent value when value.Segments is null || !ValidMode(value.Mode) || value.Segments.Any(range => !TickConversions.IsValidTickRange(range.StartTicks, range.EndTicks)) => new(SegmentChangeRejectedReason.InvalidModeOrRange, "Invalid mode or tick range."),
+            ReplaceUserSegmentsForItemIntent value when value.Segments is null
+                || value.Segments.Any(segment => !ValidMode(segment.Mode) || !TickConversions.IsValidTickRange(segment.StartTicks, segment.EndTicks))
+                || value.Segments.Where(segment => segment.Id is { } id && id != Guid.Empty).GroupBy(segment => segment.Id).Any(group => group.Count() > 1)
+                => new(SegmentChangeRejectedReason.InvalidModeOrRange, "Invalid mode, tick range, or duplicate segment ID."),
             UpdateSegmentIntent value when value.SegmentId == Guid.Empty => new(SegmentChangeRejectedReason.EmptySegmentId, "Segment ID must not be empty."),
             UpdateSegmentIntent value when !TickConversions.IsValidTickRange(value.StartTicks, value.EndTicks) => new(SegmentChangeRejectedReason.InvalidSegmentIdOrRange, "Invalid tick range."),
             DeleteSegmentIntent value when value.SegmentId == Guid.Empty => new(SegmentChangeRejectedReason.EmptySegmentId, "Segment ID must not be empty."),
             RestoreSegmentIntent value when value.SegmentId == Guid.Empty => new(SegmentChangeRejectedReason.EmptySegmentId, "Segment ID must not be empty."),
             EditorDeleteSegmentIntent value when value.SegmentId == Guid.Empty => new(SegmentChangeRejectedReason.EmptySegmentId, "Segment ID must not be empty."),
             EditorDeleteSegmentIntent value when AnalysisHelpers.TryMapSegmentTypeToMode(value.ExpectedType) is null => new(SegmentChangeRejectedReason.InvalidExternalIdOrType, "Invalid segment type."),
-            SegmentVisibilityChangeIntent value when value.SeasonId == Guid.Empty => new(SegmentChangeRejectedReason.EmptySeasonId, "Season ID must not be empty."),
             _ => null
         };
     }
@@ -170,7 +230,7 @@ internal sealed partial class IntroSkipperDatabase
     /// change, so the caller can abandon the transaction on those; an Ignore that
     /// journals may additionally have staged a foreign-row operation.
     /// </summary>
-    private static async Task<MutationResult> MutateAsync(IntroSkipperDbContext db, SegmentChangeIntent intent, Func<Task<ExternalSegmentTarget?>>? resolveExternalTarget, CancellationToken cancellationToken)
+    private static async Task<MutationResult> MutateAsync(IntroSkipperDbContext db, SegmentChangeIntent intent, Func<Task<(MediaSegmentDto Segment, bool IsOwn)?>>? resolveExternalTarget, CancellationToken cancellationToken)
     {
         switch (intent)
         {
@@ -230,6 +290,31 @@ internal sealed partial class IntroSkipperDatabase
 
                     var survivors = await ReplaceUserSegmentsCoreAsync(db, value.ItemId, value.Mode, requested, cancellationToken).ConfigureAwait(false);
                     return new MutationResult(null, survivors.Select(ToValue).ToList());
+                }
+
+            case ReplaceUserSegmentsForItemIntent value:
+                {
+                    var requested = value.Segments
+                        .DistinctBy(segment => (segment.Mode, segment.StartTicks, segment.EndTicks))
+                        .ToList();
+                    var survivors = await ReplaceUserSegmentsForItemCoreAsync(db, value.ItemId, requested, cancellationToken).ConfigureAwait(false);
+
+                    // The bulk image is authoritative for every mode. Clearing all
+                    // analysis records prevents an omitted automatic range from being
+                    // recreated on the next verification pass; requested ranges have
+                    // already been promoted to user ownership above.
+                    foreach (var mode in AnalysisHelpers.ModeToSegmentType.Keys)
+                    {
+                        await ClearItemAnalysisCoreAsync(db, value.ItemId, mode, cancellationToken).ConfigureAwait(false);
+                    }
+
+                    return new MutationResult(
+                        null,
+                        survivors
+                            .OrderBy(segment => segment.Type)
+                            .ThenBy(segment => segment.StartTicks)
+                            .Select(ToValue)
+                            .ToList());
                 }
 
             case UpdateSegmentIntent value:
@@ -330,10 +415,10 @@ internal sealed partial class IntroSkipperDatabase
                     // this arm needs the read, and the caller's stripe keeps it
                     // race-free against concurrent projections — and require it to
                     // corroborate the request before the external delete runs.
-                    var target = resolveExternalTarget is null
+                    var resolved = resolveExternalTarget is null
                         ? null
                         : await resolveExternalTarget().ConfigureAwait(false);
-                    if (target is null || target.Id != value.SegmentId)
+                    if (resolved is not var (target, isOwn) || target.Id != value.SegmentId)
                     {
                         // The row may be missing because this very delete's journaled
                         // operation already removed it while the item sync behind it
@@ -362,12 +447,12 @@ internal sealed partial class IntroSkipperDatabase
                             TypeMismatchMessage(value.SegmentId, target.Type, value.ExpectedType));
                     }
 
-                    return await DeleteExternalRowAsync(db, value.ItemId, value.SegmentId, value.ExpectedType, target, itemRows, cancellationToken).ConfigureAwait(false);
+                    return await DeleteExternalRowAsync(db, value.ItemId, value.SegmentId, value.ExpectedType, target, isOwn, itemRows, cancellationToken).ConfigureAwait(false);
                 }
 
             case SegmentVisibilityChangeIntent value:
                 {
-                    var (_, changed) = await SetItemDisabledCoreAsync(db, value.SeasonId, value.ItemId, !value.Visible, cancellationToken).ConfigureAwait(false);
+                    var changed = await SetItemDisabledCoreAsync(db, value.ItemId, !value.Visible, cancellationToken).ConfigureAwait(false);
                     if (!changed)
                     {
                         return value.Visible
@@ -389,18 +474,20 @@ internal sealed partial class IntroSkipperDatabase
     }
 
     /// <summary>
-    /// Deletes one exactly validated, uncorrelated Jellyfin row and its plugin
-    /// counterpart. The counterpart is matched by the shared uncorrelated rule
-    /// (1-tick tolerance, closest wins, non-commercial mode-wide fallback), without
-    /// which a pre-shared-id row sitting one tick off would stay active and the very
-    /// sync this change journals would resurrect the deleted segment. The fallback
-    /// cannot re-claim after a concurrent or retried single-row delete: every such
-    /// delete journals its target's operation, and the pending-op guard above
-    /// answers those retries before matching runs. The journaled operation removes
-    /// the foreign row either way, carrying the validated boundaries for the
+    /// Deletes one exactly validated, uncorrelated Jellyfin row and, when Intro
+    /// Skipper's provider wrote it, its plugin counterpart. Another provider's row
+    /// says nothing about the plugin's segments, so its delete touches no plugin row
+    /// and no analysis record. The counterpart is matched by the shared uncorrelated
+    /// rule (1-tick tolerance, closest wins, non-commercial mode-wide fallback),
+    /// without which a pre-shared-id row sitting one tick off would stay active and
+    /// the very sync this change journals would resurrect the deleted segment. The
+    /// fallback cannot re-claim after a concurrent or retried single-row delete:
+    /// every such delete journals its target's operation, and the pending-op guard
+    /// above answers those retries before matching runs. The journaled operation
+    /// removes the Jellyfin row either way, carrying the validated boundaries for the
     /// apply-time guard.
     /// </summary>
-    private static async Task<MutationResult> DeleteExternalRowAsync(IntroSkipperDbContext db, Guid itemId, Guid externalSegmentId, MediaSegmentType expectedType, ExternalSegmentTarget target, List<DbSegment> itemRows, CancellationToken cancellationToken)
+    private static async Task<MutationResult> DeleteExternalRowAsync(IntroSkipperDbContext db, Guid itemId, Guid externalSegmentId, MediaSegmentType expectedType, MediaSegmentDto target, bool isOwn, List<DbSegment> itemRows, CancellationToken cancellationToken)
     {
         var mode = AnalysisHelpers.TryMapSegmentTypeToMode(expectedType)!.Value;
 
@@ -419,7 +506,9 @@ internal sealed partial class IntroSkipperDatabase
             return MutationResult.Ignore(SegmentChangeIgnoredReason.SegmentMissingOrDeleted, "The external segment's delete is already journaled.");
         }
 
-        var match = FindUncorrelatedCounterpart(itemRows.Where(s => s.State == SegmentState.Active).ToList(), mode, target.StartTicks, target.EndTicks);
+        var match = isOwn
+            ? FindUncorrelatedCounterpart(itemRows.Where(s => s.State == SegmentState.Active).ToList(), mode, target.StartTicks, target.EndTicks)
+            : null;
 
         var affected = new List<SegmentValue>();
         if (match is not null)
@@ -432,11 +521,11 @@ internal sealed partial class IntroSkipperDatabase
     }
 
     /// <summary>
-    /// Finds the plugin counterpart of a Jellyfin row that shares no plugin id (a row
-    /// predating the shared-id scheme, or a foreign-provider row) by mode and
-    /// boundaries. Several rows can sit inside the tolerance (1-tick-shifted copies of
-    /// the same boundaries), so the closest one wins (an exact match beats a shifted
-    /// copy) with the id as a deterministic tie-break instead of enumeration order. A
+    /// Finds the plugin counterpart of an Intro Skipper Jellyfin row that shares no
+    /// plugin id (typically a row predating the shared-id scheme) by mode and boundaries.
+    /// Several rows can sit inside the tolerance (1-tick-shifted copies of the same
+    /// boundaries), so the closest one wins (an exact match beats a shifted copy)
+    /// with the id as a deterministic tie-break instead of enumeration order. A
     /// Jellyfin row can drift further from its plugin counterpart when re-analysis or
     /// edits ran while mirroring was off; the legacy DELETE wire matched mode-wide for
     /// non-commercial types, so that is honored where it is unambiguous: exactly one

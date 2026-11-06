@@ -1,3 +1,4 @@
+// SPDX-FileCopyrightText: 2026 AbandonedCart
 // SPDX-FileCopyrightText: 2026 rlauuzo
 // SPDX-License-Identifier: GPL-3.0-only
 
@@ -71,9 +72,9 @@ public enum SegmentChangeRejectedReason
     /// <summary>The external segment has another type.</summary>
     ExternalTypeMismatch,
 
-    /// <summary>The season ID is empty.</summary>
-    EmptySeasonId,
-
     /// <summary>The intent type is not supported.</summary>
-    UnsupportedIntent
+    UnsupportedIntent,
+
+    /// <summary>The editor submitted a revision that is no longer current.</summary>
+    RevisionMismatch
 }

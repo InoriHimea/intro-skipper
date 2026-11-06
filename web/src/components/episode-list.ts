@@ -1,34 +1,44 @@
 import { el } from "./dom.ts";
 import { formatTime, pluralize } from "../utils.ts";
+import { childScope, ignoreAbort } from "../lifecycle.ts";
 import * as api from "../store/api.ts";
 import { getImageUrl } from "../store/jellyfin-client.ts";
 import { MODE_OPTIONS, segmentEditor, sortSegments, sourceBadgeText } from "./segment-editor.ts";
+import type { StatusState } from "./async-feedback.ts";
 import type { EpisodeItem, SegmentDto, ApiResult } from "../types.ts";
 
 /** Delay before filtering the episode list (ms). */
 const FILTER_DEBOUNCE_MS = 120;
 
-export function episodeList(): {
+/** One season's worth of episodes. `signal` is the season panel's lifetime. */
+type EpisodeListView = {
+    episodes: EpisodeItem[];
+    segments: Array<ApiResult<SegmentDto[]> | null>;
+    isMovie?: boolean;
+    disable?: {
+        ids: string[];
+        onChange: (itemId: string, disabled: boolean) => Promise<void>;
+    };
+    signal: AbortSignal;
+};
+
+/**
+ * The filterable episode cards of the Timestamps browser. `signal` is the
+ * tab's lifetime; each render() gets the panel's, and the inline editors it
+ * creates end with the next render() or clear().
+ */
+export function episodeList(signal: AbortSignal): {
     container: HTMLElement;
-    render: (
-        episodes: EpisodeItem[],
-        segments: Array<ApiResult<SegmentDto[]> | null>,
-        isMovie?: boolean,
-        disable?: {
-            ids: string[];
-            onChange: (itemId: string, disabled: boolean) => Promise<void>;
-        },
-    ) => void;
+    render: (view: EpisodeListView) => void;
     clear: () => void;
     setStatus: (
         msg: string,
-        color?: string,
+        state?: StatusState,
         action?: { label: string; onClick: () => void },
     ) => void;
     hasUnsavedEdits: () => boolean;
-    destroy: () => void;
 } {
-    const container = el("div");
+    const container = el("div", { className: "ts-episodes" });
 
     const filterBar = el("div", { className: "ts-filter-bar" });
     const filterInput = el("input", {
@@ -44,23 +54,26 @@ export function episodeList(): {
     filterBar.append(filterInput, countEl);
 
     const statusEl = el("div", { className: "ts-status-msg" });
-    statusEl.style.display = "none";
     statusEl.setAttribute("aria-live", "polite");
 
-    const listEl = el("div");
+    const listEl = el("div", { className: "ts-episode-list" });
 
     container.append(filterBar, statusEl, listEl);
 
     let currentEpisodes: EpisodeItem[] = [];
     let currentCards: HTMLElement[] = [];
     let filterTimer: ReturnType<typeof setTimeout> | null = null;
-    let editors: Array<{ isDirty: () => boolean; destroy: () => void }> = [];
+    // The rendered season's editors share one lifetime, ended by the next
+    // render() or clear() and by the panel itself.
+    let editorsScope = childScope(signal);
+    let editors: Array<{ isDirty: () => boolean }> = [];
     let editorCounter = 0;
 
     function ticksToMinutes(ticks: number | null): string {
         if (!ticks) return "";
         const minutes = Math.round(ticks / 10_000_000 / 60);
-        return minutes + " min";
+        // A no-break space keeps the number and its unit on one line.
+        return minutes + "\u00a0min";
     }
 
     let isMovieView = false;
@@ -105,32 +118,31 @@ export function episodeList(): {
         info.append(header);
 
         if (!result || !result.ok) {
-            card.classList.add("error");
             const errorDiv = el("div", { className: "ts-episode-error" });
             errorDiv.append(document.createTextNode("Failed to load segments"));
 
             const retryBtn = el("button", { className: "ts-retry-link", type: "button" }, "Retry");
             retryBtn.setAttribute("aria-label", "Retry loading segments for " + ep.Name);
-            retryBtn.addEventListener("click", async () => {
-                // Retry only this episode so one failed request does not force a full reload.
+            // Retry only this episode so one failed request does not force a full reload.
+            const retry = async () => {
                 retryBtn.textContent = "Loading…";
                 // disabled (not pointer-events) so keyboard activation cannot
                 // start a second concurrent retry.
                 retryBtn.disabled = true;
-                const retryResult = await api.getEpisodeSegments(ep.Id);
-                if (retryResult && retryResult.ok) {
-                    card.classList.remove("error");
+                const retryResult = await api.getEpisodeSegments(ep.Id, editorsScope.signal);
+                if (retryResult.ok) {
                     info.removeChild(errorDiv);
-                    attachSegmentUi(ep, header, info, retryResult.data ?? []);
+                    attachSegmentUi(ep, header, info, retryResult.data);
                 } else {
                     retryBtn.textContent = "Retry";
                     retryBtn.disabled = false;
                 }
-            });
+            };
+            retryBtn.addEventListener("click", () => void retry().catch(ignoreAbort));
             errorDiv.append(retryBtn);
             info.append(errorDiv);
         } else {
-            attachSegmentUi(ep, header, info, result.data ?? []);
+            attachSegmentUi(ep, header, info, result.data);
         }
 
         card.append(info);
@@ -139,7 +151,7 @@ export function episodeList(): {
 
     /**
      * Renders the segment pill row plus a lazily-created inline editor toggled by
-     * an Edit button in the header. Mutations refresh the pills in place — no
+     * an Edit button in the header. Mutations refresh the pills in place, with no
      * full-season reload.
      */
     function attachSegmentUi(
@@ -169,6 +181,7 @@ export function episodeList(): {
                         pillsRow.replaceWith(fresh);
                         pillsRow = fresh;
                     },
+                    signal: editorsScope.signal,
                 });
                 editor.container.id = editorId;
                 editBtn.setAttribute("aria-controls", editorId);
@@ -215,7 +228,8 @@ export function episodeList(): {
             }
         });
 
-        header.append(toggle);
+        // The label gives the small switch its 44px hit area.
+        header.append(el("label", { className: "ts-episode-toggle" }, toggle));
     }
 
     function buildSegmentPills(segments: SegmentDto[]): HTMLElement {
@@ -225,7 +239,12 @@ export function episodeList(): {
             const ofMode = active.filter((s) => s.Type === mode.value);
             if (ofMode.length === 0) {
                 row.append(
-                    el("span", { className: "ts-timestamp-missing" }, mode.label + " –"),
+                    el(
+                        "span",
+                        { className: "ts-timestamp-missing" },
+                        el("span", { className: "ts-pill-mode" }, mode.label),
+                        "–",
+                    ),
                 );
                 continue;
             }
@@ -234,7 +253,8 @@ export function episodeList(): {
                 const pill = el(
                     "span",
                     { className: "ts-timestamp-pill" + (seg.Source === "User" ? " user" : "") },
-                    mode.label + " " + formatTime(seg.Start) + " – " + formatTime(seg.End),
+                    el("span", { className: "ts-pill-mode" }, mode.label),
+                    formatTime(seg.Start) + " – " + formatTime(seg.End),
                 );
                 pill.append(el("span", { className: "ts-pill-source" }, sourceBadgeText(seg)));
                 row.append(pill);
@@ -249,7 +269,7 @@ export function episodeList(): {
         currentCards.forEach((card, i) => {
             const name = currentEpisodes[i]?.Name?.toLowerCase() ?? "";
             const visible = !query || name.includes(query);
-            card.style.display = visible ? "" : "none";
+            card.hidden = !visible;
             if (visible) visibleCount++;
         });
 
@@ -261,60 +281,64 @@ export function episodeList(): {
         countEl.textContent = pluralize(visibleCount, "episode");
     }
 
-    const handleFilterInput = () => {
-        if (filterTimer) clearTimeout(filterTimer);
-        filterTimer = setTimeout(() => {
-            applyFilter();
-        }, FILTER_DEBOUNCE_MS);
-    };
+    filterInput.addEventListener(
+        "input",
+        () => {
+            if (filterTimer) clearTimeout(filterTimer);
+            filterTimer = setTimeout(() => {
+                applyFilter();
+            }, FILTER_DEBOUNCE_MS);
+        },
+        { signal },
+    );
 
-    filterInput.addEventListener("input", handleFilterInput);
+    signal.addEventListener(
+        "abort",
+        () => {
+            if (filterTimer) clearTimeout(filterTimer);
+        },
+        { once: true },
+    );
 
-    function destroyEditors(): void {
-        for (const editor of editors) {
-            editor.destroy();
-        }
+    function dropEditors(): void {
+        editorsScope.abort();
         editors = [];
     }
 
     return {
         container,
 
-        render(
-            episodes: EpisodeItem[],
-            segments: Array<ApiResult<SegmentDto[]> | null>,
-            isMovie = false,
-            disable?: { ids: string[]; onChange: (itemId: string, disabled: boolean) => Promise<void> },
-        ) {
-            isMovieView = isMovie;
-            currentDisabledIds = new Set(disable?.ids);
-            onDisabledChange = disable?.onChange ?? null;
-            currentEpisodes = episodes;
+        render(view) {
+            dropEditors();
+            editorsScope = childScope(view.signal);
+            isMovieView = view.isMovie ?? false;
+            currentDisabledIds = new Set(view.disable?.ids);
+            onDisabledChange = view.disable?.onChange ?? null;
+            currentEpisodes = view.episodes;
             listEl.replaceChildren();
-            destroyEditors();
             currentCards = [];
             if (filterTimer) clearTimeout(filterTimer);
             filterInput.value = "";
 
-            if (episodes.length === 0) {
+            if (view.episodes.length === 0) {
                 listEl.append(el("div", { className: "ts-status-msg" }, "No episodes found."));
                 countEl.textContent = "";
                 return;
             }
 
-            for (let i = 0; i < episodes.length; i++) {
-                const card = buildCard(episodes[i], segments[i] ?? null, i);
+            for (let i = 0; i < view.episodes.length; i++) {
+                const card = buildCard(view.episodes[i], view.segments[i] ?? null, i);
                 currentCards.push(card);
                 listEl.append(card);
             }
 
-            countEl.textContent = pluralize(episodes.length, "episode");
-            statusEl.style.display = "none";
+            countEl.textContent = pluralize(view.episodes.length, "episode");
+            statusEl.replaceChildren();
         },
 
         clear() {
+            dropEditors();
             listEl.replaceChildren();
-            destroyEditors();
             currentCards = [];
             currentEpisodes = [];
             currentDisabledIds = new Set();
@@ -324,13 +348,10 @@ export function episodeList(): {
             filterInput.value = "";
         },
 
-        setStatus(
-            msg: string,
-            color = "var(--is-text-muted)",
-            action?: { label: string; onClick: () => void },
-        ) {
+        setStatus(msg, state, action) {
+            if (state) statusEl.dataset.state = state;
+            else delete statusEl.dataset.state;
             if (!msg) {
-                statusEl.style.display = "none";
                 statusEl.replaceChildren();
                 return;
             }
@@ -344,23 +365,12 @@ export function episodeList(): {
                 actionBtn.addEventListener("click", action.onClick);
                 statusEl.append(" ", actionBtn);
             }
-            statusEl.style.color = color;
-            statusEl.style.display = "block";
         },
 
         // True while any live inline editor (expanded or collapsed) holds
         // unsaved typed input.
         hasUnsavedEdits() {
             return editors.some((editor) => editor.isDirty());
-        },
-
-        destroy() {
-            if (filterTimer) {
-                clearTimeout(filterTimer);
-                filterTimer = null;
-            }
-            destroyEditors();
-            filterInput.removeEventListener("input", handleFilterInput);
         },
     };
 }

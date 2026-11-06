@@ -13,7 +13,7 @@ pnpm --dir "$ROOT/web" build >> "$RUN/web-build.log" 2>&1
 "$DOTNET" restore "$ROOT/IntroSkipper.Tests/IntroSkipper.Tests.csproj" \
   --configfile "$ROOT/nuget/NuGet.Stable.Config" --locked-mode > "$RUN/restore.log" 2>&1
 "$DOTNET" test "$ROOT/IntroSkipper.Tests/IntroSkipper.Tests.csproj" -c Release --no-restore \
-  -p:SkipWebBuild=true -p:Version=12.0.4.0 -p:AssemblyVersion=12.0.4.0 -p:FileVersion=12.0.4.0 \
+  -p:SkipWebBuild=true \
   --filter 'FullyQualifiedName~TestCommunityFallback|FullyQualifiedName~TestPlaybackOutroTail|FullyQualifiedName~TestTimeAdjustmentHelper|FullyQualifiedName~TestConfigHasher|FullyQualifiedName~TestAnalysisConfigHash|FullyQualifiedName~TestSegmentsApiController|FullyQualifiedName~SegmentEditorControllerTests|FullyQualifiedName~TestMediaSegmentMirror|FullyQualifiedName~TestPluginConfiguration|FullyQualifiedName~TestLegacyAnalysisCompatibility|FullyQualifiedName~TestSeasonReanalysis|FullyQualifiedName~TestDatabaseServiceRegistration|FullyQualifiedName~TestBaseItemAnalyzerTask|FullyQualifiedName~TestQueue|FullyQualifiedName~TestCreditsPass|FullyQualifiedName~TestChapterAnalyzer|FullyQualifiedName~TestDatabaseFacades' \
   --logger 'trx;LogFileName=regression.trx' --results-directory "$RUN" > "$RUN/tests.log" 2>&1
 cp "$ROOT/IntroSkipper/bin/Release/net10.0/IntroSkipper.dll" "$RUN/IntroSkipper.dll"

@@ -6,10 +6,12 @@
 
 using System.Net.Mime;
 using System.Runtime.InteropServices;
+using IntroSkipper.Configuration;
 using IntroSkipper.Data;
 using IntroSkipper.FFmpeg;
 using IntroSkipper.Helper;
 using IntroSkipper.ScheduledTasks;
+using IntroSkipper.Services;
 using MediaBrowser.Common;
 using MediaBrowser.Common.Api;
 using MediaBrowser.Model.Tasks;
@@ -33,6 +35,7 @@ public partial class TroubleshootingController : ControllerBase
     private readonly ILogger<TroubleshootingController> _logger;
     private readonly IFFmpegService _ffmpegService;
     private readonly ITaskManager _taskManager;
+    private readonly AnalysisScheduler _queue;
 
     /// <summary>
     /// Initializes a new instance of the <see cref="TroubleshootingController"/> class.
@@ -40,17 +43,20 @@ public partial class TroubleshootingController : ControllerBase
     /// <param name="applicationHost">Application host.</param>
     /// <param name="logger">Logger.</param>
     /// <param name="ffmpegService">FFmpeg service.</param>
-    /// <param name="taskManager">Scheduled task manager, used to report the detection task's last run.</param>
+    /// <param name="taskManager">Scheduled task manager, used to report the detection task's last run and progress.</param>
+    /// <param name="queue">Analysis queue, used to report what is running and pending.</param>
     public TroubleshootingController(
         IApplicationHost applicationHost,
         ILogger<TroubleshootingController> logger,
         IFFmpegService ffmpegService,
-        ITaskManager taskManager)
+        ITaskManager taskManager,
+        AnalysisScheduler queue)
     {
         _applicationHost = applicationHost;
         _logger = logger;
         _ffmpegService = ffmpegService;
         _taskManager = taskManager;
+        _queue = queue;
     }
 
     /// <summary>
@@ -87,12 +93,39 @@ public partial class TroubleshootingController : ControllerBase
     [ProducesResponseType(StatusCodes.Status200OK)]
     public ActionResult<SupportBundle> GetSupportBundleJson() => BuildSupportBundle();
 
+    /// <summary>
+    /// Resets every plugin setting to its default and saves the configuration. The series, movie and
+    /// path exclusion lists are user data rather than tuning and are kept. Jellyfin's per-library
+    /// provider selection, the injected skip button CSS, and the season and show overrides in the
+    /// plugin database are stored outside the plugin configuration and are left as they are.
+    /// </summary>
+    /// <response code="204">Configuration reset.</response>
+    /// <returns>No content.</returns>
+    [HttpPost("Configuration/Reset")]
+    [ProducesResponseType(StatusCodes.Status204NoContent)]
+    public ActionResult ResetConfiguration()
+    {
+        var plugin = Plugin.Instance!;
+        var current = plugin.Configuration;
+        plugin.UpdateConfiguration(new PluginConfiguration
+        {
+            SeriesExclusions = [.. current.SeriesExclusions],
+            MovieExclusions = [.. current.MovieExclusions],
+            PathExclusions = [.. current.PathExclusions],
+
+            // Runtime state the plugin detects at startup, not a setting.
+            FileTransformationPluginEnabled = current.FileTransformationPluginEnabled,
+        });
+        return NoContent();
+    }
+
     private SupportBundle BuildSupportBundle()
     {
         var plugin = Plugin.Instance!;
         var ffmpeg = _ffmpegService.GetCheckResult();
         var settings = ConfigurationReport.Enumerate(plugin.Configuration);
-        var detectTask = ScanState.FindDetectTask(_taskManager);
+        var detectTask = _taskManager.ScheduledTasks.FirstOrDefault(t => t.ScheduledTask is DetectSegmentsTask);
+        var queue = _queue.Status;
 
         List<SupportBundleSection> sections =
         [
@@ -102,14 +135,14 @@ public partial class TroubleshootingController : ControllerBase
                 [
                     new("Jellyfin version", _applicationHost.ApplicationVersionString),
                     new("Plugin version", GetPluginVersion()),
-                    new("Runs on", Helper.OperatingSystem.DetermineOperatingSystem()),
+                    new("Runs on", DescribeOperatingSystem()),
                     new("Runtime", FormattableString.Invariant($"{RuntimeInformation.FrameworkDescription}, {RuntimeInformation.RuntimeIdentifier}, {Environment.ProcessorCount} CPUs")),
                     new("FFmpeg", ffmpeg.Status),
                     new("FFmpeg path", string.IsNullOrEmpty(plugin.FFmpegPath) ? "unknown" : plugin.FFmpegPath),
                     new("Debug logging", _logger.IsEnabled(LogLevel.Debug) ? "on" : "off"),
                     new("Last scan", detectTask is null ? "unknown" : DescribeLastRun(detectTask)),
-                    new("Scan running", DescribeScanState(detectTask)),
-                    new("Queue contents", FormattableString.Invariant($"{plugin.TotalQueued} episodes, {plugin.TotalSeasons} seasons")),
+                    new("Scan running", DescribeScanState(queue, detectTask)),
+                    new("Queue", DescribeQueue(queue)),
                     new("Warnings", WarningManager.GetWarnings()),
                     new(
                         "File Transformation plugin",
@@ -125,10 +158,27 @@ public partial class TroubleshootingController : ControllerBase
             {
                 Text = string.Join('\n', settings.Select(s => $"{s.Name}: {s.Value}")),
             },
+            new("Fingerprint failures since the last full scan", Collapsed: true)
+            {
+                Text = DescribeFingerprintFailures(),
+            },
             .. ffmpeg.Outputs.Select(o => new SupportBundleSection($"FFmpeg {o.Name}", Collapsed: true) { Text = o.Output }),
         ];
 
         return new SupportBundle(sections);
+    }
+
+    // One failure per line, or null so the section renders as "None".
+    private static string? DescribeFingerprintFailures()
+    {
+        var (failures, dropped) = WarningManager.GetFingerprintFailures();
+        if (failures.Count == 0)
+        {
+            return null;
+        }
+
+        var text = string.Join('\n', failures);
+        return dropped > 0 ? text + FormattableString.Invariant($"\nand {dropped} more") : text;
     }
 
     // "2026-08-22 03:00 UTC, Completed in 14 min", with the error message appended for failed runs.
@@ -149,23 +199,72 @@ public partial class TroubleshootingController : ControllerBase
         return string.IsNullOrWhiteSpace(result.ErrorMessage) ? summary : summary + ": " + result.ErrorMessage.ReplaceLineEndings(" ").Trim();
     }
 
-    // ScanState owns the running definition (shared with the dashboard's ScanStatus endpoint);
-    // the worker only contributes its cancelling state and progress here.
-    private static string DescribeScanState(IScheduledTaskWorker? task)
+    // The queue owns the running definition (shared with the dashboard's ScanStatus
+    // endpoint); the scheduled task worker only contributes its progress while a library
+    // pass runs.
+    private static string DescribeScanState(AnalysisSchedulerStatus queue, IScheduledTaskWorker? task)
     {
-        if (task?.State == TaskState.Cancelling)
+        if (!queue.PassRunning)
         {
-            return "cancelling";
-        }
-
-        if (!ScanState.IsRunning(task))
-        {
-            return "no";
+            return queue.IsRunning ? "pending" : "no";
         }
 
         return task is { State: TaskState.Running, CurrentProgress: { } progress }
             ? FormattableString.Invariant($"yes ({progress:0}%)")
             : "yes";
+    }
+
+    // "2 changed items, 1 manual scan, library pass pending", or "empty".
+    private static string DescribeQueue(AnalysisSchedulerStatus queue)
+    {
+        List<string> parts = [];
+        if (queue.ChangedItems > 0)
+        {
+            parts.Add(FormattableString.Invariant($"{queue.ChangedItems} changed item{(queue.ChangedItems == 1 ? string.Empty : "s")}"));
+        }
+
+        if (queue.ManualScans > 0)
+        {
+            parts.Add(FormattableString.Invariant($"{queue.ManualScans} manual scan{(queue.ManualScans == 1 ? string.Empty : "s")}"));
+        }
+
+        if (queue.LibraryPending)
+        {
+            parts.Add("library pass pending");
+        }
+
+        return parts.Count == 0 ? "empty" : string.Join(", ", parts);
+    }
+
+    // Names the host operating system, telling the common Docker images apart on Linux.
+    private static string DescribeOperatingSystem()
+    {
+        if (OperatingSystem.IsWindows())
+        {
+            return "Windows";
+        }
+
+        if (OperatingSystem.IsMacOS())
+        {
+            return "macOS";
+        }
+
+        if (!OperatingSystem.IsLinux())
+        {
+            return "Unknown";
+        }
+
+        if (!System.IO.File.Exists("/.dockerenv") && !System.IO.File.Exists("/run/.containerenv"))
+        {
+            return RuntimeInformation.OSDescription;
+        }
+
+        if (Environment.GetEnvironmentVariable("ATTACHED_DEVICES_PERMS") != null)
+        {
+            return "LinuxServer.io image (Docker)";
+        }
+
+        return Environment.GetEnvironmentVariable("WEBUI_PORTS") != null ? "hotio image (Docker)" : "Linux (Docker)";
     }
 
     private static string FormatDuration(TimeSpan duration) => duration switch

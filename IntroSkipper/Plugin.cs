@@ -8,9 +8,7 @@
 // SPDX-FileCopyrightText: 2024 theMasterpc
 // SPDX-License-Identifier: GPL-3.0-only
 
-using System.Collections.Concurrent;
 using IntroSkipper.Configuration;
-using IntroSkipper.Data;
 using IntroSkipper.Db;
 using MediaBrowser.Common.Configuration;
 using MediaBrowser.Common.Plugins;
@@ -19,6 +17,7 @@ using MediaBrowser.Controller.Configuration;
 using MediaBrowser.Controller.Entities;
 using MediaBrowser.Controller.Library;
 using MediaBrowser.Model.Entities;
+using MediaBrowser.Model.Globalization;
 using MediaBrowser.Model.Plugins;
 using MediaBrowser.Model.Serialization;
 
@@ -29,7 +28,7 @@ namespace IntroSkipper;
 /// </summary>
 /// <remarks>
 /// This class contains no database code. All database access lives in
-/// <see cref="IIntroSkipperDatabase"/> and <see cref="IDetectionCacheDatabase"/>;
+/// <see cref="IntroSkipperDatabase"/> and <see cref="DetectionCacheDatabase"/>;
 /// every consumer receives the facades by constructor injection, and their
 /// initialization gates own the database lifecycle.
 /// </remarks>
@@ -39,6 +38,8 @@ public class Plugin : BasePlugin<PluginConfiguration>, IHasWebPages
     private readonly ILibraryManager _libraryManager;
     private readonly IChapterManager _chapterRepository;
     private readonly IPluginManager _pluginManager;
+    private readonly ILocalizationManager _localization;
+    private readonly IServerConfigurationManager _serverConfiguration;
 
     /// <summary>
     /// Initializes a new instance of the <see cref="Plugin"/> class.
@@ -49,13 +50,15 @@ public class Plugin : BasePlugin<PluginConfiguration>, IHasWebPages
     /// <param name="libraryManager">Library manager.</param>
     /// <param name="chapterRepository">Chapter repository.</param>
     /// <param name="pluginManager">Plugin manager.</param>
+    /// <param name="localization">Jellyfin's localization manager.</param>
     public Plugin(
         IApplicationPaths applicationPaths,
         IXmlSerializer xmlSerializer,
         IServerConfigurationManager serverConfiguration,
         ILibraryManager libraryManager,
         IChapterManager chapterRepository,
-        IPluginManager pluginManager)
+        IPluginManager pluginManager,
+        ILocalizationManager localization)
         : base(applicationPaths, xmlSerializer)
     {
         Instance = this;
@@ -63,8 +66,10 @@ public class Plugin : BasePlugin<PluginConfiguration>, IHasWebPages
         _libraryManager = libraryManager;
         _chapterRepository = chapterRepository;
         _pluginManager = pluginManager;
+        _localization = localization;
+        _serverConfiguration = serverConfiguration;
 
-        FFmpegPath = serverConfiguration.GetEncodingOptions().EncoderAppPathDisplay;
+        TempDirectory = applicationPaths.TempDirectory;
 
         // Creates the plugin data directory when missing.
         IntroSkipperDatabasePaths.GetPluginDirectory(applicationPaths);
@@ -72,27 +77,30 @@ public class Plugin : BasePlugin<PluginConfiguration>, IHasWebPages
         Configuration.FileTransformationPluginEnabled = _pluginManager
             .Plugins
             .Any(p => p.Id == Guid.Parse("5e87cc92-571a-4d8d-8d98-d2d4147f9f90")); // File Transformation plugin ID
+
+        // Upgrades in memory only. A save here throws on a read-only configuration file, and a
+        // throwing constructor makes Jellyfin mark the plugin malfunctioned.
+        Configuration.UpgradeLegacyDefaults();
     }
 
     /// <summary>
-    /// Gets the most recent media item queue.
+    /// Gets the ffmpeg path from Jellyfin's encoding configuration. Read on every use: Jellyfin
+    /// validates and stores the path only after plugins and hosted services start, so until then
+    /// this is the previous run's path, or <see langword="null"/> on a fresh configuration.
     /// </summary>
-    internal ConcurrentDictionary<Guid, List<QueuedEpisode>> QueuedMediaItems { get; } = new();
+    internal string? FFmpegPath => _serverConfiguration.GetEncodingOptions().EncoderAppPathDisplay;
 
     /// <summary>
-    /// Gets the total number of media items in the queue.
+    /// Gets Jellyfin's temporary directory, whose stale files Jellyfin's cache cleanup task deletes.
     /// </summary>
-    internal int TotalQueued => QueuedMediaItems.Values.Sum(episodes => episodes.Count);
+    internal string TempDirectory { get; }
 
     /// <summary>
-    /// Gets the number of seasons in the queue.
+    /// Gets the format Jellyfin names a chapter without a title with, under the server's
+    /// language, with <c>{0}</c> for the chapter number: "Chapter {0}" in English. The embedded
+    /// chapter read names untitled chapters with it, so both chapter sources hold the same names.
     /// </summary>
-    internal int TotalSeasons => QueuedMediaItems.Count;
-
-    /// <summary>
-    /// Gets the full path to FFmpeg.
-    /// </summary>
-    internal string FFmpegPath { get; }
+    internal string ChapterNameFormat => _localization.GetServerLocalizedString("ChapterNameValue");
 
     /// <inheritdoc />
     public override string Name => ProviderName;

@@ -1,4 +1,5 @@
 // SPDX-FileCopyrightText: 2026 rlauuzo
+// SPDX-FileCopyrightText: 2026 AbandonedCart
 // SPDX-License-Identifier: GPL-3.0-only
 
 using IntroSkipper.Data;
@@ -23,6 +24,12 @@ public sealed record AddUserSegmentIntent(Guid ItemId, AnalysisMode Mode, long S
 /// <param name="Segments">Complete user range set.</param>
 public sealed record ReplaceUserSegmentsForModeIntent(Guid ItemId, AnalysisMode Mode, IReadOnlyList<SegmentRange> Segments) : SegmentChangeIntent(ItemId);
 
+/// <summary>Replaces the complete user-visible segment image for one item.</summary>
+/// <param name="ItemId">Item ID.</param>
+/// <param name="Segments">The complete desired active segment set. IDs are hints used to preserve existing rows.</param>
+/// <param name="ExpectedRevision">The editor snapshot revision that must still be current, or <c>*</c> to accept any current revision.</param>
+public sealed record ReplaceUserSegmentsForItemIntent(Guid ItemId, IReadOnlyList<UserSegmentInput> Segments, string? ExpectedRevision = null) : SegmentChangeIntent(ItemId);
+
 /// <summary>Updates one segment and promotes the surviving row to user provenance.</summary>
 /// <param name="ItemId">Item ID.</param>
 /// <param name="SegmentId">Segment ID.</param>
@@ -42,9 +49,8 @@ public sealed record RestoreSegmentIntent(Guid ItemId, Guid SegmentId) : Segment
 
 /// <summary>Changes whether automatic segments are visible for one item.</summary>
 /// <param name="ItemId">Item ID.</param>
-/// <param name="SeasonId">Owning season-state key.</param>
 /// <param name="Visible">Whether automatic output is visible.</param>
-public sealed record SegmentVisibilityChangeIntent(Guid ItemId, Guid SeasonId, bool Visible) : SegmentChangeIntent(ItemId);
+public sealed record SegmentVisibilityChangeIntent(Guid ItemId, bool Visible) : SegmentChangeIntent(ItemId);
 
 /// <summary>
 /// Deletes one editor-addressed segment, the single external-delete intent (the
@@ -52,7 +58,8 @@ public sealed record SegmentVisibilityChangeIntent(Guid ItemId, Guid SeasonId, b
 /// sharing the id is deleted authoritatively (tombstoning automatic rows) with its
 /// Jellyfin twin's targeted delete journaled; an id with no plugin row resolves the
 /// Jellyfin row lazily inside the transaction, validates its ownership, matches the
-/// uncorrelated plugin counterpart, and journals the foreign row's durable delete.
+/// uncorrelated plugin counterpart when Intro Skipper's provider wrote the row, and
+/// journals the Jellyfin row's durable delete.
 /// </summary>
 /// <param name="ItemId">Owning item ID.</param>
 /// <param name="SegmentId">Editor-visible segment ID (shared with the plugin row when one exists).</param>
@@ -63,3 +70,10 @@ public sealed record EditorDeleteSegmentIntent(Guid ItemId, Guid SegmentId, Medi
 /// <param name="StartTicks">Start ticks.</param>
 /// <param name="EndTicks">End ticks.</param>
 public sealed record SegmentRange(long StartTicks, long EndTicks);
+
+/// <summary>One segment in an item-wide replacement request.</summary>
+/// <param name="Id">Existing segment ID, when the caller knows it.</param>
+/// <param name="Mode">Analysis mode.</param>
+/// <param name="StartTicks">Start ticks.</param>
+/// <param name="EndTicks">End ticks.</param>
+public sealed record UserSegmentInput(Guid? Id, AnalysisMode Mode, long StartTicks, long EndTicks);

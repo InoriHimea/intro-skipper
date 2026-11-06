@@ -5,6 +5,7 @@
 using System.Data.Common;
 using System.IO.Compression;
 using System.Text.Json;
+using IntroSkipper.Configuration;
 using IntroSkipper.Data;
 using IntroSkipper.Db;
 using IntroSkipper.Helper;
@@ -16,17 +17,17 @@ namespace IntroSkipper.FFmpeg;
 /// <summary>
 /// Manages reading and writing detection results to/from the SQLite cache.
 /// Serialization, compression and configuration-hash policy live here; all database
-/// access is delegated to <see cref="IDetectionCacheDatabase"/>.
+/// access is delegated to <see cref="DetectionCacheDatabase"/>.
 /// </summary>
 /// <remarks>
 /// Initializes a new instance of the <see cref="DetectionCacheService"/> class.
 /// </remarks>
 /// <param name="logger">The logger instance.</param>
 /// <param name="cacheDatabase">The detection cache database facade.</param>
-public sealed partial class DetectionCacheService(ILogger<DetectionCacheService> logger, IDetectionCacheDatabase cacheDatabase)
+public sealed partial class DetectionCacheService(ILogger<DetectionCacheService> logger, DetectionCacheDatabase cacheDatabase)
 {
     private readonly ILogger<DetectionCacheService> _logger = logger;
-    private readonly IDetectionCacheDatabase _cacheDatabase = cacheDatabase;
+    private readonly DetectionCacheDatabase _cacheDatabase = cacheDatabase;
 
     /// <summary>
     /// Tries to read a cached detection result from the SQLite DB.
@@ -37,6 +38,7 @@ public sealed partial class DetectionCacheService(ILogger<DetectionCacheService>
     /// <param name="type">One of the enumeration values that specifies the cache entry type.</param>
     /// <param name="start">The start position used as a cache key component.</param>
     /// <param name="end">The end position used as a cache key component.</param>
+    /// <param name="config">The configuration the scan runs under; the row is read only when its hash was computed from the same scan settings.</param>
     /// <param name="result">When this method returns, contains the cached result array, or an empty array if the cache was missed. This parameter is treated as uninitialized.</param>
     /// <param name="cacheVariant">Optional effective stream identity for stream-sensitive cache entries.</param>
     /// <param name="legacyConfigHash">Pre-stream-selection hash to accept as well, when the caller knows the row's stream is still the effective one.</param>
@@ -47,6 +49,7 @@ public sealed partial class DetectionCacheService(ILogger<DetectionCacheService>
         CacheEntryType type,
         double start,
         double end,
+        PluginConfiguration config,
         out T[] result,
         string? cacheVariant = null,
         string? legacyConfigHash = null)
@@ -65,7 +68,7 @@ public sealed partial class DetectionCacheService(ILogger<DetectionCacheService>
                 return false;
             }
 
-            var expectedHash = ConfigHasher.DetectionCache(Plugin.Instance?.Configuration ?? new(), type, mode, cacheVariant);
+            var expectedHash = ConfigHasher.DetectionCache(config, type, mode, cacheVariant);
             var hashMatches = string.IsNullOrEmpty(entry.ConfigHash)
                 || string.Equals(entry.ConfigHash, expectedHash, StringComparison.Ordinal)
                 || string.Equals(entry.ConfigHash, legacyConfigHash, StringComparison.Ordinal);
@@ -106,6 +109,7 @@ public sealed partial class DetectionCacheService(ILogger<DetectionCacheService>
     /// <param name="type">One of the enumeration values that specifies the cache entry type.</param>
     /// <param name="start">The start position used as a cache key component.</param>
     /// <param name="end">The end position used as a cache key component.</param>
+    /// <param name="config">The configuration the scan ran under; the row's hash is computed from it.</param>
     /// <param name="items">The result array to cache.</param>
     /// <param name="cacheVariant">Optional effective stream identity for stream-sensitive cache entries.</param>
     public void Write<T>(
@@ -114,11 +118,12 @@ public sealed partial class DetectionCacheService(ILogger<DetectionCacheService>
         CacheEntryType type,
         double start,
         double end,
+        PluginConfiguration config,
         T[] items,
         string? cacheVariant = null)
     {
         var data = CompressBrotli(items);
-        var configHash = ConfigHasher.DetectionCache(Plugin.Instance?.Configuration ?? new(), type, mode, cacheVariant);
+        var configHash = ConfigHasher.DetectionCache(config, type, mode, cacheVariant);
 
         try
         {

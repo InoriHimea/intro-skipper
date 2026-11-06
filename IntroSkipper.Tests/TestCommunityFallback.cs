@@ -14,6 +14,7 @@ using IntroSkipper.Configuration;
 using IntroSkipper.Data;
 using IntroSkipper.Db;
 using IntroSkipper.Helper;
+using IntroSkipper.ScheduledTasks;
 using MediaBrowser.Controller.Entities;
 using MediaBrowser.Controller.Entities.TV;
 using MediaBrowser.Model.Entities;
@@ -181,9 +182,8 @@ public sealed class TestCommunityFallback : IDisposable
     [Fact]
     public void AnalysisHash_IsUnchangedWhileFallbackIsOff()
     {
-        // Upgrading must not reopen any settled season: the default-off hash equals the
-        // hash pinned for releases without the feature.
-        Assert.Equal("353008E48A5F559E", ConfigHasher.Analysis(new PluginConfiguration(), AnalysisMode.Credits, AnalyzerAction.Default, true));
+        // The fallback-off hash follows the current upstream chapter-pattern defaults.
+        Assert.Equal("7EF68040EE4E4EC7", ConfigHasher.Analysis(new PluginConfiguration(), AnalysisMode.Credits, AnalyzerAction.Default, true));
         Assert.NotEqual(
             ConfigHasher.Analysis(new PluginConfiguration(), AnalysisMode.Introduction, AnalyzerAction.Default, true),
             ConfigHasher.Analysis(new PluginConfiguration { EnableCommunityFallback = true }, AnalysisMode.Introduction, AnalyzerAction.Default, true));
@@ -193,29 +193,86 @@ public sealed class TestCommunityFallback : IDisposable
     }
 
     [Theory]
-    [InlineData(true)]
-    [InlineData(false)]
-    public async Task HashAdoption_ReopensOnlyResultsTheSwitchCanChange(bool enabling)
+    [InlineData(true, ChapterSource.JellyfinTable, false)]
+    [InlineData(false, ChapterSource.JellyfinTable, false)]
+    [InlineData(true, ChapterSource.Embedded, true)]
+    [InlineData(false, ChapterSource.Embedded, true)]
+    public async Task HashAdoption_ReopensOnlyResultsTheSwitchCanChange(bool enabling, ChapterSource source, bool seasonOverrides)
     {
-        var config = new PluginConfiguration { EnableCommunityFallback = enabling };
-        var previous = ConfigHasher.Analysis(config, AnalysisMode.Introduction, AnalyzerAction.Default, true, !enabling);
-        var current = ConfigHasher.Analysis(config, AnalysisMode.Introduction, AnalyzerAction.Default, true);
+        var config = new PluginConfiguration { EnableCommunityFallback = enabling, UseEmbeddedChaptersForAnalysis = source == ChapterSource.Embedded };
+        int? percent = seasonOverrides ? 40 : null;
+        int? limit = seasonOverrides ? 12 : null;
+        var previous = ConfigHasher.Analysis(config, AnalysisMode.Introduction, AnalyzerAction.Default, true, percent, limit, communityFallback: !enabling);
+        var current = ConfigHasher.Analysis(config, AnalysisMode.Introduction, AnalyzerAction.Default, true, percent, limit);
         var database = _db.Database;
         var withLocal = Guid.NewGuid();
         var withCommunity = Guid.NewGuid();
         var empty = Guid.NewGuid();
         await database.ReplaceAutoSegmentsAsync(withLocal, AnalysisMode.Introduction, [new Segment(withLocal, new TimeRange(10, 60))], SegmentSource.Chapter, previous);
         await database.ReplaceAutoSegmentsAsync(withCommunity, AnalysisMode.Introduction, [new Segment(withCommunity, new TimeRange(0, 85))], SegmentSource.Community, previous);
-        await database.MarkItemsAnalyzedAsync(AnalysisMode.Introduction, [withLocal, withCommunity, empty], previous);
+        await database.MarkItemsAnalyzedAsync(AnalysisMode.Introduction, [(withLocal, null), (withCommunity, null), (empty, null)], previous);
         var seasonId = Guid.NewGuid();
         var snapshot = await database.GetSeasonQueueSnapshotAsync(seasonId, [withLocal, withCommunity, empty]);
 
-        Assert.True(await CommunityHashAdoption.UpgradeAsync(database, snapshot, config));
+        Assert.True(await CommunityHashAdoption.UpgradeAsync(database, snapshot, config, analysisPercentOverride: percent, analysisLengthLimitOverride: limit));
 
-        var hashes = (await database.GetSeasonQueueSnapshotAsync(seasonId, [withLocal, withCommunity, empty])).AnalyzedConfigHashes;
-        Assert.Equal(current, hashes[(withLocal, AnalysisMode.Introduction)]);
-        Assert.Equal(enabling ? current : previous, hashes[(withCommunity, AnalysisMode.Introduction)]);
-        Assert.Equal(previous, hashes[(empty, AnalysisMode.Introduction)]);
+        var records = (await database.GetSeasonQueueSnapshotAsync(seasonId, [withLocal, withCommunity, empty])).AnalysisRecords;
+        Assert.Equal(current, records[(withLocal, AnalysisMode.Introduction)].ConfigHash);
+        Assert.Equal(enabling ? current : previous, records[(withCommunity, AnalysisMode.Introduction)].ConfigHash);
+        Assert.Equal(previous, records[(empty, AnalysisMode.Introduction)].ConfigHash);
+    }
+
+    [Fact]
+    public async Task AnalyzerPass_FillsOnlyAfterLocalAnalysisFindsNothing()
+    {
+        var config = Config();
+        var (_, episode) = SetupSeries(config);
+        episode.Chapters = [];
+        var source = new FakeSource(Found(intro: new CommunityRange(0, 90.083)));
+        var task = new BaseItemAnalyzerTask(NullLoggerFactory.Instance, null!, new StubFFmpegService(), null!, null!, _db.Database);
+
+        await task.AnalyzeItemsAsync([episode], AnalysisMode.Introduction, AnalyzerAction.Default, false, CancellationToken.None, communityFallback: Fallback(source));
+
+        Assert.Single(source.Asked);
+        Assert.Equal(EpisodeState.Analyzed, episode.GetAnalyzed(AnalysisMode.Introduction));
+        var segment = Assert.Single(await _db.Database.GetSegmentsAsync(episode.EpisodeId));
+        Assert.Equal(SegmentSource.Community, segment.Source);
+        var snapshot = await _db.Database.GetSeasonQueueSnapshotAsync(episode.SeasonId, [episode.EpisodeId]);
+        Assert.Equal(segment.ConfigHash, snapshot.AnalysisRecords[(episode.EpisodeId, AnalysisMode.Introduction)].ConfigHash);
+    }
+
+    [Theory]
+    [InlineData(7, SegmentSource.Community)]
+    [InlineData(8, SegmentSource.Subtitle)]
+    [InlineData(9, SegmentSource.KeyframeVisuals)]
+    public async Task PersistedSources_RemainDistinct(int storedValue, SegmentSource expected)
+    {
+        var itemId = Guid.NewGuid();
+        await _db.Database.ReplaceAutoSegmentsAsync(itemId, AnalysisMode.Credits, [new Segment(itemId, new TimeRange(100, 120))], (SegmentSource)storedValue, "source-test");
+
+        Assert.Equal(expected, Assert.Single(await _db.Database.GetSegmentsAsync(itemId)).Source);
+    }
+
+    [Theory]
+    [InlineData(true)]
+    [InlineData(false)]
+    public async Task CreditsHashAdoption_PreservesSeasonPreviewOverride(bool enabling)
+    {
+        var config = new PluginConfiguration { EnableCommunityFallback = enabling, AnimePreviewFromCreditsEnd = true };
+        var itemId = Guid.NewGuid();
+        var seasonId = Guid.NewGuid();
+        var previous = ConfigHasher.Analysis(config, AnalysisMode.Credits, AnalyzerAction.Default, true, previewFromCreditsEndOverride: false, communityFallback: !enabling);
+        var current = ConfigHasher.Analysis(config, AnalysisMode.Credits, AnalyzerAction.Default, true, previewFromCreditsEndOverride: false);
+        await _db.Database.ReplaceAutoSegmentsAsync(itemId, AnalysisMode.Credits, [new Segment(itemId, new TimeRange(100, 120))], SegmentSource.KeyframeVisuals, previous);
+        await _db.Database.MarkItemsAnalyzedAsync(AnalysisMode.Credits, [(itemId, null)], previous);
+        var snapshot = await _db.Database.GetSeasonQueueSnapshotAsync(seasonId, [itemId]);
+
+        Assert.True(await CommunityHashAdoption.UpgradeAsync(_db.Database, snapshot, config, previewFromCreditsEndOverride: false));
+        var updated = await _db.Database.GetSeasonQueueSnapshotAsync(seasonId, [itemId]);
+        Assert.Equal(current, updated.AnalysisRecords[(itemId, AnalysisMode.Credits)].ConfigHash);
+        var segment = Assert.Single(await _db.Database.GetSegmentsAsync(itemId));
+        Assert.Equal(SegmentSource.KeyframeVisuals, segment.Source);
+        Assert.Equal(current, segment.ConfigHash);
     }
 
     private static PluginConfiguration Config() => new()

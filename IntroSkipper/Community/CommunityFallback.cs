@@ -19,8 +19,8 @@ namespace IntroSkipper.Community;
 /// databases. Runs after the mode's local analysis and only for episodes that analysis settled
 /// without a segment, so a local result is never replaced. Community ranges go through the same
 /// <see cref="TimeAdjustmentHelper"/> as local results, so the configured offsets apply.
-/// One instance serves one analysis run: answers are reused between the intro and credits pass
-/// of the same item, so each item costs at most one request per source per run.
+/// One instance serves one season pass: answers are reused between its intro and credits modes,
+/// so each item costs at most one request per source per pass.
 /// </summary>
 /// <param name="logger">Logger.</param>
 /// <param name="sources">Community sources in priority order.</param>
@@ -30,7 +30,7 @@ internal sealed partial class CommunityFallback(
     ILogger<CommunityFallback> logger,
     IReadOnlyList<ICommunitySource> sources,
     IFFmpegService ffmpegService,
-    IIntroSkipperDatabase database)
+    IntroSkipperDatabase database)
 {
     private readonly ConcurrentDictionary<(Guid ItemId, string Source), CommunityAnswer> _answers = new();
 

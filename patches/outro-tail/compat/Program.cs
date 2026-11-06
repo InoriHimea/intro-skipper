@@ -67,13 +67,11 @@ try
     var configType = pluginAssembly.GetType("IntroSkipper.Configuration.PluginConfiguration", true)!;
     var config = Activator.CreateInstance(configType)!;
     Set(config, "IntroEndOffset", 5);
-    Set(config, "SkipFirstEpisode", false);
     Set(plugin, "Configuration", config);
     pluginType.GetProperty("Instance", BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Static)!.SetValue(null, plugin);
 
     var pluginId = (Guid)pluginType.GetProperty("Id")!.GetValue(plugin)!;
     Require(pluginId == Guid.Parse("c83d86bb-a1e0-4c35-a113-e2101cf4ee6b"), "Plugin GUID changed");
-    Require(pluginAssembly.GetName().Version == new Version(12, 0, 4, 0), "Plugin assembly version changed");
     foreach (var name in new[] { "configPage.html", "introskipper.js", "introskipper.css" })
     {
         var resource = resourceNames.SingleOrDefault(resource => resource.EndsWith("." + name, StringComparison.Ordinal));

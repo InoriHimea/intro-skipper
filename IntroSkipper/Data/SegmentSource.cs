@@ -1,5 +1,5 @@
-// SPDX-FileCopyrightText: 2026 rlauuzo
 // SPDX-FileCopyrightText: 2026 AbandonedCart
+// SPDX-FileCopyrightText: 2026 rlauuzo
 // SPDX-License-Identifier: GPL-3.0-only
 
 namespace IntroSkipper.Data;
@@ -50,6 +50,18 @@ public enum SegmentSource
     /// <summary>
     /// Fetched from a community timestamp database (IntroDB or TheIntroDB) for an
     /// episode the local analyzers settled without a segment.
+    /// Value 7 is persisted by this fork and must not be reused by another analyzer.
     /// </summary>
-    Community = 7
+    Community = 7,
+
+    /// <summary>
+    /// Detected from keyframe visuals: credits on a near-uniform low-saturation card.
+    /// Uses 9 because this fork already persisted community timestamps as 7.
+    /// </summary>
+    KeyframeVisuals = 9,
+
+    /// <summary>
+    /// Detected from a matching text subtitle cue.
+    /// </summary>
+    Subtitle = 8
 }

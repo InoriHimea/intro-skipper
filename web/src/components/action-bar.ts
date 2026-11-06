@@ -1,9 +1,11 @@
 import { el } from "./dom.ts";
 import { bindStatusMessage, withDashboardLoading } from "./async-feedback.ts";
-import { confirmDialog } from "./confirm-dialog.ts";
+import { confirmDialog, eraseCheckboxes } from "./confirm-dialog.ts";
+import { formFor } from "./input-field.ts";
+import { createOverrideStore, overrideKeys, overrideSchema } from "./season-overrides.ts";
 import * as api from "../store/api.ts";
-import type { AnalyzerActions } from "../types.ts";
-import { delay } from "../utils.ts";
+import type { AnalyzerActions, SeasonItem } from "../types.ts";
+import { abortable, childScope, delay, ignoreAbort, isAbortError } from "../lifecycle.ts";
 
 // Analyzer override choices per mode, in display order. Every mode accepts
 // Default, Chapter and None; the middle entries are the extra analyzers.
@@ -31,26 +33,43 @@ let segmentEditorActive: Promise<boolean> | null = null;
 
 function isSegmentEditorActive(): Promise<boolean> {
     if (segmentEditorActive) return segmentEditorActive;
-    const lookup = api.checkPlugins().then(
-        (plugins) => plugins.some((p) => p.Id === SEGMENT_EDITOR_PLUGIN_ID && p.Status === "Active"),
-        (err: unknown) => {
+    const lookup = api.checkPlugins().then((result) => {
+        if (!result.ok) {
             segmentEditorActive = null;
-            throw err;
-        },
-    );
+            return false;
+        }
+        return result.data.some((p) => p.Id === SEGMENT_EDITOR_PLUGIN_ID && p.Status === "Active");
+    });
     segmentEditorActive = lookup;
     return lookup;
 }
 
 type ActionBarOptions = {
     onScanComplete: () => void | Promise<void>;
+    /** The Timestamps tab's lifetime. The bar's listeners and subscriptions end with it. */
+    signal: AbortSignal;
 };
 
-export function actionBar(opts: ActionBarOptions): {
+// How a watched scan ended. "unavailable" means the status endpoint kept
+// failing, so the scan may still be running.
+type ScanOutcome = "completed" | "failed" | "unavailable";
+
+export function actionBar({ onScanComplete, signal }: ActionBarOptions): {
     container: HTMLElement;
     toggle: (open: boolean) => void;
-    loadForSeason: (showId: string, seasonId: string, isMovie: boolean) => Promise<void>;
-    destroy: () => void;
+    /**
+     * Points Scan and Erase at the season before the first await, so a caller can
+     * start it as the season starts loading without awaiting it. The season's
+     * overrides and scan state load after that. `panel` is the season panel's
+     * lifetime; the promise rejects with an AbortError once it aborts.
+     */
+    loadForSeason: (
+        showId: string,
+        seasonId: string,
+        isMovie: boolean,
+        panel: AbortSignal,
+        seriesSeasons?: readonly SeasonItem[],
+    ) => Promise<void>;
 } {
     const container = el("div", { className: "ts-action-bar" });
     container.id = "ts-action-panel";
@@ -79,10 +98,52 @@ export function actionBar(opts: ActionBarOptions): {
         analyzerGroup.append(item);
     }
 
+    // The per-season overrides: the second store the field controls bind to.
+    const overrides = createOverrideStore();
+    const overrideForm = formFor(overrideSchema, overrides, signal);
+
+    const analysisWindow = el("fieldset", { className: "ts-analysis-window" });
+    const analysisWindowLegend = el("legend", {}, "Season overrides");
+    const analysisWindowDescription = el(
+        "p",
+        { className: "ts-action-description" },
+        "Optional per-season limits and detection settings. Blank fields and Global selections inherit the plugin settings.",
+    );
+    const analysisWindowGrid = el("div", { className: "ts-analysis-window-grid" });
+    analysisWindowGrid.append(
+        overrideForm.field("AnalysisPercent"),
+        overrideForm.field("AnalysisLengthLimit"),
+    );
+    const subtitleOverrideRow = el("div", { className: "ts-analysis-window-grid ts-subtitle-override-row" });
+    subtitleOverrideRow.append(
+        overrideForm.field("SubtitleRecapDetection"),
+        overrideForm.field("SubtitlePreviewDetection"),
+    );
+    const resetWindowBtn = el(
+        "button",
+        { className: "ts-reset-overrides", type: "button" },
+        "Use global defaults",
+    );
+    resetWindowBtn.addEventListener(
+        "click",
+        () => {
+            for (const key of overrideKeys) overrides.set(key, null);
+        },
+        { signal },
+    );
+    analysisWindow.append(
+        analysisWindowLegend,
+        analysisWindowDescription,
+        analysisWindowGrid,
+        subtitleOverrideRow,
+        overrideForm.field("PreviewFromCreditsEnd"),
+    );
+    analysisWindow.append(resetWindowBtn);
+
     const applyBtn = el(
         "button",
         { className: "ts-action-btn apply", type: "button" },
-        "Save Analyzer Overrides",
+        "Save Overrides",
     );
     const scanBtn = el(
         "button",
@@ -95,196 +156,297 @@ export function actionBar(opts: ActionBarOptions): {
         "Erase Season Timestamps",
     );
 
+    const fullSeriesId = "ts-full-series";
+    const fullSeriesCheckbox = el("input", {
+        type: "checkbox",
+        id: fullSeriesId,
+    });
+    const fullSeriesLabel = el(
+        "label",
+        { className: "ts-full-series", for: fullSeriesId },
+        "Full Series",
+    );
+    fullSeriesLabel.prepend(fullSeriesCheckbox);
+
     const buttonsDiv = el("div", { className: "ts-action-buttons" });
     buttonsDiv.append(applyBtn, scanBtn, eraseBtn);
 
-    const row = el("div", { className: "ts-action-row" });
-    row.append(analyzerGroup, buttonsDiv);
-
-    const metaRow = el("div", { className: "ts-action-meta" });
-    const statusEl = el("div", { className: "ts-action-status" });
-    const statusMessage = bindStatusMessage(statusEl, { display: "block" });
     const editorLink = el(
         "a",
         {
+            className: "ts-action-editor-link",
             href: "#/dashboard/plugins/" + SEGMENT_EDITOR_PLUGIN_ID + "?name=Segment Editor",
         },
-        "Segment Editor \u2192",
+        "Segment Editor →",
     );
-    metaRow.append(editorLink);
 
-    container.append(row, metaRow, statusEl);
+    const topRow = el("div", { className: "ts-action-top-row" });
+    topRow.append(analyzerGroup, editorLink);
+
+    const scopeRow = el("div", { className: "ts-action-scope" });
+    const scopeHint = el("span", { className: "ts-action-scope-hint" });
+    scopeRow.append(fullSeriesLabel, scopeHint);
+    const bottomRow = el("div", { className: "ts-action-bottom-row" });
+    bottomRow.append(scopeRow, buttonsDiv);
+
+    const statusEl = el("div", { className: "ts-action-status" });
+    const statusMessage = bindStatusMessage(statusEl);
+
+    container.append(topRow, analysisWindow, bottomRow, statusEl);
 
     let currentShowId = "";
     let currentSeasonId = "";
     let currentIsMovie = false;
-    let destroyed = false;
-    let loadVersion = 0;
-    let scanVersion = 0;
+    let currentSeriesSeasons: readonly SeasonItem[] = [];
+    // False until the season's saved overrides arrive, and again after a failed
+    // read, so Save cannot turn a transient failure into a destructive reset.
+    let overridesLoaded = false;
+    // The season panel the bar currently serves. Its loads and the watched scan
+    // take this signal, so a load abandoned by navigation stops at its next await.
+    let panel: AbortSignal = signal;
+    // The scan being watched, if any. A new scan or a new season load ends it.
+    let scanScope: AbortController | null = null;
+
+    function startScan(): AbortSignal {
+        scanScope?.abort();
+        scanScope = childScope(panel);
+        return scanScope.signal;
+    }
+
+    function updateApplyAvailability(): void {
+        applyBtn.disabled = currentIsMovie || !overridesLoaded;
+        if (!overridesLoaded && !currentIsMovie) {
+            applyBtn.title = "Analysis-window settings are still loading.";
+        } else {
+            applyBtn.removeAttribute("title");
+        }
+    }
 
     function updateActionLabels(): void {
-        scanBtn.textContent = currentIsMovie ? "Scan Movie" : "Scan Season";
+        scopeHint.textContent = fullSeriesCheckbox.checked
+            ? "Every season in this series"
+            : "Current season only";
+        scanBtn.textContent = currentIsMovie
+            ? "Scan Movie"
+            : fullSeriesCheckbox.checked
+              ? "Scan Series"
+              : "Scan Season";
         eraseBtn.textContent = currentIsMovie
             ? "Erase Movie Timestamps"
-            : "Erase Season Timestamps";
+            : fullSeriesCheckbox.checked
+              ? "Erase Series Timestamps"
+              : "Erase Season Timestamps";
     }
 
     function resetScanButton(): void {
         scanBtn.disabled = false;
+        fullSeriesCheckbox.disabled = false;
         updateActionLabels();
     }
 
-    const handleApplyClick = async () => {
-        if (destroyed) return;
-
-        statusMessage.show("Saving analyzer overrides\u2026", "var(--is-text-muted)");
-
-        try {
-            await withDashboardLoading(async () => {
-                const actions: AnalyzerActions = {};
-                for (const [key, select] of actionSelects) {
-                    actions[key] = select.value;
-                }
-                await api.updateAnalyzerActions(currentSeasonId, actions);
-            });
-            statusMessage.show("Analyzer overrides updated.", "var(--is-success)");
-        } catch {
-            statusMessage.show("Failed to update analyzer overrides.", "var(--is-error)");
-        }
-    };
-
-    const pollForScanCompletion = async (scanToken: number): Promise<void> => {
-        const MAX_POLL_ATTEMPTS = 300; // ~10 minutes with base interval
-        const BASE_INTERVAL = 1000;
-        const MAX_INTERVAL = 10_000;
-
-        let attempts = 0;
-        let interval = BASE_INTERVAL;
-
-        while (!destroyed && scanToken === scanVersion && attempts < MAX_POLL_ATTEMPTS) {
-            await delay(interval);
-            if (destroyed || scanToken !== scanVersion) {
-                return;
-            }
-
-            attempts++;
-            const status = await api.getScanStatus();
-
-            if (destroyed || scanToken !== scanVersion) {
-                return;
-            }
-
-            if (status.ok && !status.data?.isRunning) {
-                resetScanButton();
-                // The onScanComplete callback owns the refresh (and may withhold
-                // it over unsaved edits), so this message must not claim one.
-                statusMessage.show("Scan finished.", "var(--is-success)");
-                await Promise.resolve(opts.onScanComplete());
-                return;
-            }
-
-            if (!status.ok) {
-                interval = Math.min(interval * 2, MAX_INTERVAL);
-            } else {
-                interval = BASE_INTERVAL;
-            }
+    function targetSeasonIds(): string[] {
+        if (currentIsMovie || !fullSeriesCheckbox.checked || currentSeriesSeasons.length === 0) {
+            return [currentIsMovie ? currentShowId : currentSeasonId];
         }
 
-        if (destroyed || scanToken !== scanVersion) {
+        return currentSeriesSeasons.map((season) => season.Id);
+    }
+
+    fullSeriesCheckbox.addEventListener("change", updateActionLabels, { signal });
+
+    async function applyOverrides(): Promise<void> {
+        if (!overridesLoaded) return;
+
+        const error = overrides.firstError();
+        if (error) {
+            statusMessage.show(error, "error");
             return;
         }
 
-        resetScanButton();
-        statusMessage.show(
-            "Scan status polling timed out. Refresh to check results.",
-            "var(--is-warning)",
-        );
-    };
+        const operation = panel;
+        const seasonIds = targetSeasonIds();
+        const actions: AnalyzerActions = {};
+        for (const [key, select] of actionSelects) {
+            actions[key] = select.value;
+        }
+        const values = overrides.values();
 
-    const handleScanClick = async () => {
-        if (destroyed) return;
+        statusMessage.show("Saving overrides…");
 
-        const scanToken = ++scanVersion;
-        scanBtn.disabled = true;
-        statusMessage.show("Starting scan\u2026", "var(--is-text-muted)");
+        // The saves finish across navigation, so a series save reaches every
+        // season. Only the report belongs to the season that asked.
         try {
-            const response = await withDashboardLoading(async () => {
-                const seasonId = currentIsMovie ? currentShowId : currentSeasonId;
-                return api.scanSeason(currentShowId, seasonId);
+            await withDashboardLoading(async () => {
+                for (const seasonId of seasonIds) {
+                    const response = await api.updateAnalyzerActions(seasonId, actions);
+                    if (!response.ok) {
+                        throw new Error("Failed to update analyzer overrides");
+                    }
+                    const windowResponse = await api.updateAnalysisOverrides(seasonId, values);
+                    if (!windowResponse.ok) {
+                        throw new Error("Failed to update analysis window");
+                    }
+                }
             });
-
-            if (destroyed || scanToken !== scanVersion) {
-                return;
-            }
-
-            if (response.status === 409) {
-                statusMessage.show("A scan is already in progress.", "var(--is-warning)");
-            } else if (!response.ok) {
-                resetScanButton();
-                statusMessage.show("Unable to start the scan.", "var(--is-error)");
-                return;
-            }
-
-            scanBtn.textContent = "Scan in progress\u2026";
-            statusMessage.show(
-                "Scan in progress\u2026 This can take several minutes.",
-                "var(--is-text-muted)",
-            );
-
-            void pollForScanCompletion(scanToken).catch(console.error);
+            if (operation.aborted) return;
+            statusMessage.show("Overrides updated.", "success");
         } catch {
-            resetScanButton();
-            statusMessage.show("Unable to start the scan.", "var(--is-error)");
+            if (operation.aborted) return;
+            statusMessage.show("Failed to update overrides.", "error");
         }
-    };
+    }
 
-    const handleEraseClick = async () => {
-        if (destroyed) return;
+    // Waits for the season's queued scan. The scan may wait behind a running pass
+    // for as long as that pass takes, so only repeated status failures end the
+    // wait early. Rejects with an AbortError when `scan` aborts.
+    async function awaitScan(seasonId: string, scan: AbortSignal): Promise<ScanOutcome> {
+        const MAX_FAILURES = 30;
+        const BASE_INTERVAL = 1000;
+        const MAX_INTERVAL = 10_000;
 
-        const label = currentIsMovie ? "movie" : "season";
-        // A movie's season-state key is its own ID, so it fills both route segments.
-        const seasonId = currentIsMovie ? currentShowId : currentSeasonId;
-        const url =
-            "Intros/Show/" +
-            encodeURIComponent(currentShowId) +
-            "/" +
-            encodeURIComponent(seasonId);
-        const result = await confirmDialog({
-            title: "Confirm Timestamp Erasure",
-            body: "Are you sure you want to erase all timestamps for this " + label + "?",
-            confirmLabel: "Erase",
-            checkbox: { label: "Include cached fingerprints" },
-        });
-        if (destroyed) return;
-        if (!result) return;
-        statusMessage.show("Erasing timestamps\u2026", "var(--is-text-muted)");
+        let failures = 0;
+        let interval = BASE_INTERVAL;
+
+        while (true) {
+            await delay(interval, scan);
+            const status = await api.getScanStatus(seasonId, scan);
+
+            if (status.ok && status.data) {
+                if (!status.data.isQueued) return status.data.failed ? "failed" : "completed";
+                failures = 0;
+                interval = BASE_INTERVAL;
+                continue;
+            }
+
+            failures++;
+            if (failures >= MAX_FAILURES) return "unavailable";
+            interval = Math.min(interval * 2, MAX_INTERVAL);
+        }
+    }
+
+    // Puts the buttons back and reports how the scan ended. onScanComplete owns
+    // the refresh (and may withhold it over unsaved edits), so the message must
+    // not claim one.
+    async function finishScan(outcome: ScanOutcome): Promise<void> {
+        resetScanButton();
+        if (outcome === "unavailable") {
+            statusMessage.show("Scan status unavailable. Refresh to check results.", "warning");
+            return;
+        }
+        if (outcome === "failed") {
+            statusMessage.show("Scan failed. See the server log.", "error");
+        } else {
+            statusMessage.show("Scan finished.", "success");
+        }
+        await Promise.resolve(onScanComplete());
+    }
+
+    async function runScan(): Promise<void> {
+        const scan = startScan();
+        scanBtn.disabled = true;
+        fullSeriesCheckbox.disabled = true;
+        const showId = currentShowId;
+        const seasonIds = targetSeasonIds();
+        const isSeriesScan = !currentIsMovie && fullSeriesCheckbox.checked;
+        statusMessage.show("Starting scan…");
         try {
-            const response = await api.eraseItemTimestamps(url, result.checkboxChecked);
-            if (!response.ok) {
-                statusMessage.show("Failed to erase timestamps.", "var(--is-error)");
+            // Every season is queued before any is watched, so leaving the view
+            // cannot drop the seasons not yet queued.
+            const started = await withDashboardLoading(async () => {
+                for (const seasonId of seasonIds) {
+                    if (!(await api.scanSeason(showId, seasonId)).ok) return false;
+                }
+                return true;
+            });
+            if (scan.aborted) return;
+            if (!started) {
+                resetScanButton();
+                statusMessage.show("Unable to start the scan.", "error");
                 return;
             }
-            statusMessage.show("Timestamps erased.", "var(--is-success)");
-            await Promise.resolve(opts.onScanComplete());
-        } catch {
-            statusMessage.show("Failed to erase timestamps.", "var(--is-error)");
+
+            scanBtn.textContent = "Scan in progress…";
+            for (let index = 0; index < seasonIds.length; index++) {
+                const progress = isSeriesScan
+                    ? " (" + String(index + 1) + "/" + String(seasonIds.length) + ")"
+                    : "";
+                statusMessage.show(
+                    (isSeriesScan ? "Scanning series" + progress : "Scan queued") +
+                        "… This can take several minutes.",
+                );
+
+                const outcome = await awaitScan(seasonIds[index], scan);
+                if (outcome !== "completed") {
+                    await finishScan(outcome);
+                    return;
+                }
+            }
+
+            await finishScan("completed");
+        } catch (err) {
+            if (isAbortError(err)) return;
+            resetScanButton();
+            statusMessage.show("Unable to start the scan.", "error");
         }
-    };
+    }
+
+    async function eraseTimestamps(): Promise<void> {
+        const isSeriesErase = !currentIsMovie && fullSeriesCheckbox.checked;
+        const label = currentIsMovie ? "movie" : isSeriesErase ? "series" : "season";
+        const operation = panel;
+        const showId = currentShowId;
+        const seasonIds = targetSeasonIds();
+        const result = await abortable(
+            confirmDialog({
+                title: "Confirm Timestamp Erasure",
+                body: "Are you sure you want to erase the detected timestamps for this " + label + "? User segments are kept.",
+                confirmLabel: "Erase",
+                checkboxes: eraseCheckboxes,
+            }),
+            signal,
+        );
+        if (!result) return;
+        eraseBtn.disabled = true;
+        fullSeriesCheckbox.disabled = true;
+        statusMessage.show("Erasing timestamps…");
+        try {
+            for (const seasonId of seasonIds) {
+                // Not signalled: a confirmed erase reaches every season even if
+                // the user leaves the tab.
+                const response = await api.eraseSeasonTimestamps(showId, seasonId, result);
+                if (!response.ok) {
+                    if (operation.aborted) return;
+                    // The seasons before this one are erased, so show them as they are now.
+                    await Promise.resolve(onScanComplete());
+                    statusMessage.show("Failed to erase timestamps.", "error");
+                    return;
+                }
+            }
+            // Only the report and the refresh belong to the season that asked.
+            if (operation.aborted) return;
+            statusMessage.show("Timestamps erased.", "success");
+            await Promise.resolve(onScanComplete());
+        } catch (err) {
+            if (isAbortError(err) || operation.aborted) return;
+            statusMessage.show("Failed to erase timestamps.", "error");
+        } finally {
+            eraseBtn.disabled = false;
+            fullSeriesCheckbox.disabled = false;
+        }
+    }
 
     // Resolve the editor link at construction time so it's ready before the
     // user navigates to a specific season. A failed lookup leaves the generic
     // plugin page link in place.
-    isSegmentEditorActive()
-        .then((isActive) => {
-            if (isActive && !destroyed) {
-                editorLink.setAttribute("href", "#/configurationpage?name=Segment%20Editor");
-            }
-        })
-        .catch(() => {});
+    void isSegmentEditorActive().then((isActive) => {
+        if (isActive && !signal.aborted) {
+            editorLink.setAttribute("href", "#/configurationpage?name=Segment%20Editor");
+        }
+    });
 
-    applyBtn.addEventListener("click", handleApplyClick);
-    scanBtn.addEventListener("click", handleScanClick);
-    eraseBtn.addEventListener("click", handleEraseClick);
+    applyBtn.addEventListener("click", () => void applyOverrides().catch(ignoreAbort), { signal });
+    scanBtn.addEventListener("click", () => void runScan().catch(ignoreAbort), { signal });
+    eraseBtn.addEventListener("click", () => void eraseTimestamps().catch(ignoreAbort), { signal });
 
     return {
         container,
@@ -293,57 +455,72 @@ export function actionBar(opts: ActionBarOptions): {
             container.classList.toggle("open", open);
         },
 
-        async loadForSeason(showId: string, seasonId: string, isMovie: boolean) {
-            if (destroyed) return;
-
-            const loadToken = ++loadVersion;
-            scanVersion += 1;
+        async loadForSeason(showId, seasonId, isMovie, panelSignal, seriesSeasons) {
+            panel = panelSignal;
+            scanScope?.abort();
+            scanScope = null;
+            if (currentShowId !== showId) {
+                fullSeriesCheckbox.checked = false;
+                currentSeriesSeasons = [];
+            }
             currentShowId = showId;
             currentSeasonId = seasonId;
             currentIsMovie = isMovie;
+            overridesLoaded = false;
+            if (seriesSeasons) {
+                currentSeriesSeasons = seriesSeasons;
+            }
 
             resetScanButton();
+            eraseBtn.disabled = false;
+            updateApplyAvailability();
             statusMessage.clear();
 
             // Analyzer overrides only apply to seasons, not single movies.
             analyzerGroup.style.display = isMovie ? "none" : "";
             applyBtn.style.display = isMovie ? "none" : "";
+            fullSeriesLabel.style.display = isMovie ? "none" : "";
+            scopeRow.style.display = isMovie ? "none" : "";
+            analysisWindow.style.display = isMovie ? "none" : "";
 
             if (!isMovie) {
-                const result = await api.getAnalyzerActions(seasonId);
-                if (destroyed || loadToken !== loadVersion) {
-                    return;
-                }
+                const [result, overrideResult] = await Promise.all([
+                    api.getAnalyzerActions(seasonId, panel),
+                    api.getAnalysisOverrides(seasonId, panel),
+                ]);
 
                 const actions: AnalyzerActions = result.ok && result.data ? result.data : {};
                 for (const [key, select] of actionSelects) {
                     select.value = actions[key] ?? "Default";
                 }
+                // On a failed read the last known values stay visible but Save
+                // stays off.
+                if (overrideResult.ok && overrideResult.data) {
+                    overrides.load(overrideResult.data);
+                    overridesLoaded = true;
+                }
+                updateApplyAvailability();
             }
 
-            // Disable the button if another scan is already running server-side.
-            const status = await api.getScanStatus();
-            if (destroyed || loadToken !== loadVersion) {
+            const status = await api.getScanStatus(seasonId, panel);
+            if (!status.ok || !status.data) {
                 return;
             }
 
-            if (status.ok && status.data?.isRunning) {
+            if (status.data.isQueued) {
+                // This season's own scan is pending or running: wait for it the way a
+                // click does, so the button comes back and the view refreshes when it
+                // is done. Not awaited: the caller must not wait out the scan.
                 scanBtn.disabled = true;
-                scanBtn.textContent = "Scan in progress\u2026";
-                statusMessage.show(
-                    "Scan in progress\u2026 This can take several minutes.",
-                    "var(--is-text-muted)",
-                );
+                fullSeriesCheckbox.disabled = true;
+                scanBtn.textContent = "Scan in progress…";
+                statusMessage.show("Scan in progress… This can take several minutes.");
+                void awaitScan(seasonId, startScan()).then(finishScan).catch(ignoreAbort);
+            } else if (status.data.isRunning) {
+                // Another pass is running. It does not block a scan of this season: the
+                // queue runs it once the pass ends, so the button stays enabled.
+                statusMessage.show("Scan in progress… A new scan queues behind it.");
             }
-        },
-
-        destroy() {
-            destroyed = true;
-            loadVersion += 1;
-            scanVersion += 1;
-            applyBtn.removeEventListener("click", handleApplyClick);
-            scanBtn.removeEventListener("click", handleScanClick);
-            eraseBtn.removeEventListener("click", handleEraseClick);
         },
     };
 }

@@ -6,11 +6,11 @@
 
 | 项目 | 值 |
 | --- | --- |
-| 基线 | `inori/outro-tail-5s`（上游 `12.0/v12.0.4.0` + 片尾保留补丁） |
+| 基线 | 上游 `12.0` 分支 `223a086`（包含 `12.0/v12.0.6.0`）+ 片尾保留补丁 |
 | 补丁分支 | `inori/community-fallback` |
-| 程序集 / 文件版本 | `12.0.4.0`，保持原插件身份 |
-| 新增数据库迁移 | 无（新来源值 `Community = 7` 存入已有整数列） |
-| 宿主兼容验证 | Jellyfin `12.1.0`、`12.2.0` 实际宿主程序集 |
+| 程序集 / 文件版本 | `12.0.6.0`，保持原插件身份 |
+| 来源整数兼容 | 保留已部署的 `Community = 7`；上游 `KeyframeVisuals` 使用 `9`，`Subtitle = 8` |
+| 历史宿主兼容验证 | Jellyfin `12.1.0`、`12.2.0`；本次验证范围见下文 |
 
 ## 规则
 
@@ -58,27 +58,22 @@
 | `CommunityUseTheIntroDb` | 开 | 启用 TheIntroDB |
 | `CommunityDurationToleranceSeconds` | 5 | 版本不一致容差 |
 
-- **默认关闭时，片头/片尾分析 hash 与此前完全一致**（固定测试 `353008E48A5F559E`），升级不触发任何重扫。
+- **关闭时，不追加社区配置 hash**。本次上游更新自身改变分析规则和 hash，不能据此承诺升级不重扫；历史固定 hash 仅适用于旧基线。
 - 开启后 hash 变化，但切换时只重新打开**没有片段**的结果：已有片段的条目直接沿用到新 hash（`CommunityHashAdoption`），所以开启只会让“无片段”的条目在下次扫描时查询社区库，不会重算整库。
 - 关闭时，来源为 `Community` 的结果重新打开，其余沿用。
 
 ## 与上游合并
 
-改动集中在新目录 `IntroSkipper/Community/`、`web/src/tabs/community.ts` 与新测试文件；对上游文件只有小钩子：
+社区实现位于 `IntroSkipper/Community/`，设置页位于 `web/src/tabs/community.ts`。
 
-| 文件 | 改动 |
-| --- | --- |
-| `Data/SegmentSource.cs` | 新增 `Community = 7` |
-| `Configuration/PluginConfiguration.cs` | 4 个配置项 |
-| `Helper/ConfigHasher.cs` | 开启时才追加的 hash 片段，及带开关参数的重载 |
-| `Helper/LegacyAnalysisCompatibility.cs` | 旧版本 hash 升级固定到“关闭”状态 |
-| `Manager/QueueManager.cs` | 旧 hash 升级后调用 `CommunityHashAdoption` |
-| `Manager/AnalyzerTaskFactory.cs` | 注入来源，按次创建 `CommunityFallback` |
-| `ScheduledTasks/BaseItemAnalyzerTask.cs` | 本地分析后调用 `FillAsync` |
-| `PluginServiceRegistrator.cs` | 注册两个来源 |
-| `web/src/{types.ts,main.ts,validation/rules.ts,components/segment-editor.ts}` | 配置类型、标签页、校验、来源标签 |
+2026-11-07 同步上游调度与设置重构：
 
-上游若改动这些钩子附近的代码，冲突通常只需重放对应的一两行。
+- 删除已被上游替代的 `Manager/QueueManager.cs` 与 `Manager/AnalyzerTaskFactory.cs`；由 `ScheduledTasks/BaseItemAnalyzerTask.cs` 在本地分析后调用社区补充。来源服务为单例，查询缓存按季隔离，在该季片头/片尾间共用。
+- 使用具体 `IntroSkipperDatabase` 与 `SeasonQueueSnapshot.AnalysisRecords`；hash 兼容处理季级覆盖、章节来源和上游共识设置。
+- `Community = 7` 是已部署的持久化整数，不得改成上游新增的 `KeyframeVisuals`。该 fork 使用 `KeyframeVisuals = 9`；不要直接混用官方新版本已写入来源 7 的数据库。
+- 四个社区设置并入 `web/src/config/schema.ts`，保留 Community 与上游 Tracks 标签；移除旧 `validation/rules.ts`，使用统一表单及中止信号管理生命周期。
+
+本次本地验证：定向回归 386/386 通过；TypeScript/Vite 构建通过；浏览器验证开关控制可见性、601 秒容差拒绝及标签页切换后保留 5 秒值。新 DLL 对缓存的实际 Jellyfin 12.1 宿主程序集执行片尾保护 smoke，5 个边界场景通过。这不是完整 Jellyfin 12.2 宿主启动、社区线上扫描或 Infuse 实播验收。
 
 ## 验证
 

@@ -24,7 +24,7 @@ public class TestPlaybackOutroTailContract
         using var scope = EntrypointTestHelpers.CreatePluginScope(new PluginConfiguration
         {
             IntroEndOffset = 5,
-            SkipFirstEpisode = false
+            FirstEpisodeIntroMode = PluginConfiguration.FirstEpisodeIntroModeAnalyze
         });
         var itemId = Guid.NewGuid();
         var item = new Episode { Id = itemId, RunTimeTicks = 100 * TimeSpan.TicksPerSecond };

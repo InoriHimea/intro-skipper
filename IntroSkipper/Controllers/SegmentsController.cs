@@ -32,10 +32,10 @@ namespace IntroSkipper.Controllers;
 [ApiController]
 [Produces(MediaTypeNames.Application.Json)]
 public class SegmentsController(
-    IIntroSkipperDatabase database,
+    IntroSkipperDatabase database,
     SegmentChange segmentChange) : ControllerBase
 {
-    private readonly IIntroSkipperDatabase _database = database;
+    private readonly IntroSkipperDatabase _database = database;
     private readonly SegmentChange _segmentChange = segmentChange;
 
     /// <summary>
@@ -160,7 +160,7 @@ public class SegmentsController(
 
     /// <summary>
     /// Deletes a segment. Automatic segments are tombstoned so re-analysis does not
-    /// re-add an overlapping automatic segment; user segments are removed permanently.
+    /// re-add the deleted range; user segments are removed permanently.
     /// </summary>
     /// <param name="itemId">Item (episode or movie) id.</param>
     /// <param name="segmentId">Segment id.</param>

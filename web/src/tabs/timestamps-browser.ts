@@ -1,49 +1,57 @@
-import type { ShowItem, SeasonItem, EpisodeItem, Tab } from "../types.ts";
+import type { LibraryInfo, ShowItem, SeasonItem, EpisodeItem, Tab } from "../types.ts";
 import { createNavState } from "./timestamp-nav.ts";
 import { getEpisodesWithSegments, getDisabledItemIds } from "./timestamp-data.ts";
 import { getLibraries, getSeasons } from "../store/jellyfin-client.ts";
 import * as api from "../store/api.ts";
 import { el } from "../components/dom.ts";
-import { errorText, showTitle } from "../utils.ts";
+import { errorText, pluralize, showTitle } from "../utils.ts";
+import { abortable, childScope, ignoreAbort, isAbortError } from "../lifecycle.ts";
 import { breadcrumbNav, type BreadcrumbSegment } from "../components/breadcrumb-nav.ts";
 import { seasonTabs } from "../components/season-tabs.ts";
 import { episodeList } from "../components/episode-list.ts";
+import type { StatusState } from "../components/async-feedback.ts";
 import { actionBar } from "../components/action-bar.ts";
 import { clickableCard } from "../components/clickable-card.ts";
 import { appendManageToggle } from "../components/manage-bar.ts";
 
-let activeBrowser: { destroy: () => void } | null = null;
-
 export const timestampsTab: Tab = {
     id: "timestamps",
     label: "Timestamps",
-    render(container) {
-        activeBrowser = createTimestampsBrowser(container);
-    },
-    destroy() {
-        activeBrowser?.destroy();
-        activeBrowser = null;
+    render(container, signal) {
+        createTimestampsBrowser(container, signal);
     },
 };
 
-function createTimestampsBrowser(container: HTMLElement): { destroy: () => void } {
-    const nav$ = createNavState();
+/**
+ * Three nested lifetimes: the tab (`signal`), the current view (all libraries,
+ * one library's shows, or one show's episodes) and, inside an episodes view,
+ * the current season panel. Navigating aborts the view scope; switching seasons
+ * aborts the panel scope. Requests take the innermost signal, so a stale
+ * continuation stops at its next await instead of drawing into the new view.
+ */
+function createTimestampsBrowser(container: HTMLElement, signal: AbortSignal): void {
+    const nav$ = createNavState(signal);
+    let viewScope = childScope(signal);
+    let panelScope = childScope(viewScope.signal);
     let currentSeasonTabs: ReturnType<typeof seasonTabs> | null = null;
+    let currentSeasons: SeasonItem[] = [];
 
-    const contentEl = el("div");
+    const contentEl = el("div", { className: "ts-view" });
     const libraryCountEls = new Map<string, HTMLElement>();
 
     const nav = breadcrumbNav({
         segments: [{ label: "All Libraries" }],
         allShows: [],
         onSearchSelect: (show) => {
-            void navigateToShow(show).catch(console.error);
+            void navigateToShow(show).catch(ignoreAbort);
         },
+        signal,
     });
 
-    const epList = episodeList();
+    const epList = episodeList(signal);
     const actions = actionBar({
         onScanComplete: () => refreshUnlessEditing(),
+        signal,
     });
 
     const panelEl = el("section", { className: "ts-season-panel", id: "timestamps-season-panel" });
@@ -52,12 +60,25 @@ function createTimestampsBrowser(container: HTMLElement): { destroy: () => void 
 
     container.append(nav.container, contentEl);
 
-    void navigateToLibraries().catch(console.error);
+    void navigateToLibraries().catch(ignoreAbort);
 
-    function statusLine(message: string, color?: string): HTMLElement {
+    function nextView(): AbortSignal {
+        viewScope.abort();
+        viewScope = childScope(signal);
+        panelScope = childScope(viewScope.signal);
+        return viewScope.signal;
+    }
+
+    function nextPanel(): AbortSignal {
+        panelScope.abort();
+        panelScope = childScope(viewScope.signal);
+        return panelScope.signal;
+    }
+
+    function statusLine(message: string, state?: StatusState): HTMLElement {
         const attrs: Record<string, string> = { className: "ts-status-msg" };
-        if (color) {
-            attrs.style = "color: " + color;
+        if (state) {
+            attrs["data-state"] = state;
         }
         return el("div", attrs, message);
     }
@@ -78,6 +99,7 @@ function createTimestampsBrowser(container: HTMLElement): { destroy: () => void 
 
     function resetViewContent(): void {
         currentSeasonTabs = null;
+        currentSeasons = [];
         contentEl.replaceChildren();
         setPanelBusy(false);
         setPanelTabState(null);
@@ -95,8 +117,21 @@ function createTimestampsBrowser(container: HTMLElement): { destroy: () => void 
         }
     }
 
+    // The listing feeds the tab-wide search index even after the libraries view
+    // is gone; only the card's count belongs to the view.
+    async function loadLibraryCount(lib: LibraryInfo, view: AbortSignal): Promise<void> {
+        try {
+            const shows = await nav$.ensureLibraryShows(lib.Id, lib.Name);
+            syncSearchIndex();
+            if (!view.aborted) setLibraryCount(lib.Id, pluralize(shows.length, "item"));
+        } catch (err) {
+            if (isAbortError(err)) return;
+            if (!view.aborted) setLibraryCount(lib.Id, "Unavailable");
+        }
+    }
+
     async function navigateToLibraries(): Promise<void> {
-        const viewToken = nav$.nextViewVersion();
+        const view = nextView();
 
         nav$.setState({ view: "libraries" });
         libraryCountEls.clear();
@@ -105,14 +140,13 @@ function createTimestampsBrowser(container: HTMLElement): { destroy: () => void 
 
         nav$.showDashboardLoading();
         try {
-            const libraries = await getLibraries();
-            if (!nav$.isCurrentView(viewToken)) return;
+            const libraries = await abortable(getLibraries(), view);
 
             for (const lib of libraries) {
                 const countEl = el(
                     "span",
                     { className: "ts-episode-runtime" },
-                    "Loading items\u2026",
+                    "Loading items…",
                 );
                 libraryCountEls.set(lib.Id, countEl);
 
@@ -120,36 +154,18 @@ function createTimestampsBrowser(container: HTMLElement): { destroy: () => void 
                     title: lib.Name,
                     subtitle: countEl,
                     onClick: () => {
-                        void navigateToShows(lib.Id, lib.Name).catch(console.error);
+                        void navigateToShows(lib.Id, lib.Name).catch(ignoreAbort);
                     },
                 });
 
                 contentEl.append(card);
             }
 
-            void Promise.all(
-                libraries.map((lib) =>
-                    nav$
-                        .ensureLibraryShows(
-                            lib.Id,
-                            lib.Name,
-                            (count) => {
-                                setLibraryCount(lib.Id, count);
-                                syncSearchIndex();
-                            },
-                            () => setLibraryCount(lib.Id, "Unavailable"),
-                        )
-                        .catch(() => []),
-                ),
-            ).catch(console.error);
+            void Promise.all(libraries.map((lib) => loadLibraryCount(lib, view)));
         } catch (err) {
-            if (!nav$.isCurrentView(viewToken)) return;
+            if (isAbortError(err)) throw err;
             contentEl.append(
-                statusLine(
-                    "Failed to load libraries: " +
-                        errorText(err),
-                    "var(--is-error)",
-                ),
+                statusLine("Failed to load libraries: " + errorText(err), "error"),
             );
         } finally {
             nav$.hideDashboardLoading();
@@ -157,7 +173,7 @@ function createTimestampsBrowser(container: HTMLElement): { destroy: () => void 
     }
 
     async function navigateToShows(libraryId: string, libraryName: string): Promise<void> {
-        const viewToken = nav$.nextViewVersion();
+        const view = nextView();
 
         nav$.setState({ view: "shows", libraryId, libraryName });
         resetViewContent();
@@ -166,27 +182,19 @@ function createTimestampsBrowser(container: HTMLElement): { destroy: () => void 
         let libShows = nav$.getCachedShows(libraryId);
 
         if (!libShows) {
-            contentEl.append(statusLine("Loading shows\u2026"));
+            contentEl.append(statusLine("Loading shows…"));
             nav$.showDashboardLoading();
             try {
-                libShows = await nav$.ensureLibraryShows(
-                    libraryId,
-                    libraryName,
-                    (count) => setLibraryCount(libraryId, count),
-                    () => setLibraryCount(libraryId, "Unavailable"),
-                );
+                libShows = await abortable(nav$.ensureLibraryShows(libraryId, libraryName), view);
+                setLibraryCount(libraryId, pluralize(libShows.length, "item"));
                 syncSearchIndex();
-                if (!nav$.isCurrentView(viewToken)) return;
                 contentEl.replaceChildren();
             } catch (err) {
-                if (!nav$.isCurrentView(viewToken)) return;
+                if (isAbortError(err)) throw err;
+                setLibraryCount(libraryId, "Unavailable");
                 contentEl.replaceChildren();
                 contentEl.append(
-                    statusLine(
-                        "Failed to load shows: " +
-                            errorText(err),
-                        "var(--is-error)",
-                    ),
+                    statusLine("Failed to load shows: " + errorText(err), "error"),
                 );
                 return;
             } finally {
@@ -194,9 +202,7 @@ function createTimestampsBrowser(container: HTMLElement): { destroy: () => void 
             }
         }
 
-        if (!nav$.isCurrentView(viewToken)) return;
-
-        if (!libShows || libShows.length === 0) {
+        if (libShows.length === 0) {
             contentEl.append(statusLine("No shows found in this library."));
             return;
         }
@@ -206,7 +212,7 @@ function createTimestampsBrowser(container: HTMLElement): { destroy: () => void 
                 title: showTitle(show),
                 subtitle: show.Type,
                 onClick: () => {
-                    void navigateToShow(show).catch(console.error);
+                    void navigateToShow(show).catch(ignoreAbort);
                 },
             });
             contentEl.append(card);
@@ -214,7 +220,7 @@ function createTimestampsBrowser(container: HTMLElement): { destroy: () => void 
     }
 
     async function navigateToShow(show: ShowItem): Promise<void> {
-        const viewToken = nav$.nextViewVersion();
+        const view = nextView();
 
         resetViewContent();
 
@@ -235,8 +241,7 @@ function createTimestampsBrowser(container: HTMLElement): { destroy: () => void 
 
         nav$.showDashboardLoading();
         try {
-            const seasons = await getSeasons(show.Id);
-            if (!nav$.isCurrentView(viewToken)) return;
+            const seasons = await getSeasons(show.Id, view);
 
             if (seasons.length === 0) {
                 contentEl.append(statusLine("No seasons found."));
@@ -244,6 +249,7 @@ function createTimestampsBrowser(container: HTMLElement): { destroy: () => void 
             }
 
             const firstSeason = seasons[0];
+            currentSeasons = seasons;
             nav$.setState({
                 view: "episodes",
                 show,
@@ -258,7 +264,7 @@ function createTimestampsBrowser(container: HTMLElement): { destroy: () => void 
                 panelId: panelEl.id,
                 managePanelId: actions.container.id,
                 onSeasonSelect: (season) => {
-                    void switchSeason(show, season).catch(console.error);
+                    void switchSeason(show, season).catch(ignoreAbort);
                 },
                 onManageToggle: (open) => actions.toggle(open),
             });
@@ -266,15 +272,11 @@ function createTimestampsBrowser(container: HTMLElement): { destroy: () => void 
             setPanelTabState(currentSeasonTabs.getTabId(firstSeason.Id));
             contentEl.append(currentSeasonTabs.container, panelEl);
 
-            await loadSeasonEpisodes(show, firstSeason);
+            await loadSeasonEpisodes(show, firstSeason, seasons);
         } catch (err) {
-            if (!nav$.isCurrentView(viewToken)) return;
+            if (isAbortError(err)) throw err;
             contentEl.append(
-                statusLine(
-                    "Failed to load seasons: " +
-                        errorText(err),
-                    "var(--is-error)",
-                ),
+                statusLine("Failed to load seasons: " + errorText(err), "error"),
             );
         } finally {
             nav$.hideDashboardLoading();
@@ -282,20 +284,29 @@ function createTimestampsBrowser(container: HTMLElement): { destroy: () => void 
     }
 
     async function switchSeason(show: ShowItem, season: SeasonItem): Promise<void> {
-        if (!nav$.isAlive()) return;
+        if (signal.aborted) return;
 
         nav$.setState({ view: "episodes", show, seasonId: season.Id, seasonName: season.Name });
         setPanelTabState(currentSeasonTabs?.getTabId(season.Id) ?? null);
         updateBreadcrumbs();
-        await loadSeasonEpisodes(show, season);
+        await loadSeasonEpisodes(show, season, currentSeasons);
     }
 
-    async function loadSeasonEpisodes(show: ShowItem, season: SeasonItem): Promise<void> {
-        const panelToken = nav$.nextPanelVersion();
+    async function loadSeasonEpisodes(
+        show: ShowItem,
+        season: SeasonItem,
+        seriesSeasons: readonly SeasonItem[] = currentSeasons,
+    ): Promise<void> {
+        const panel = nextPanel();
+        // Scan and Erase target this season from now on, even if its episodes
+        // never arrive.
+        void actions
+            .loadForSeason(show.Id, season.Id, false, panel, seriesSeasons)
+            .catch(ignoreAbort);
 
         setPanelBusy(true);
         epList.clear();
-        epList.setStatus("Loading episodes\u2026");
+        epList.setStatus("Loading episodes…");
         actions.toggle(false);
 
         nav$.showDashboardLoading();
@@ -303,29 +314,29 @@ function createTimestampsBrowser(container: HTMLElement): { destroy: () => void 
             const { episodes, segments, disabledItemIds } = await getEpisodesWithSegments(
                 show.Id,
                 season.Id,
+                panel,
             );
-            if (!nav$.isCurrentPanel(panelToken)) return;
 
             if (episodes.length === 0) {
                 epList.setStatus("No episodes found.");
                 return;
             }
 
-            epList.render(episodes, segments, false, disableOption(disabledItemIds));
+            epList.render({
+                episodes,
+                segments,
+                disable: disableOption(disabledItemIds),
+                signal: panel,
+            });
             warnDisableStateUnknown(
                 disabledItemIds,
                 "Failed to load media-segment settings; the enable/disable toggles are hidden.",
             );
-            await actions.loadForSeason(show.Id, season.Id, false);
         } catch (err) {
-            if (!nav$.isCurrentPanel(panelToken)) return;
-            epList.setStatus(
-                "Failed to load episodes: " +
-                    errorText(err),
-                "var(--is-error)",
-            );
+            if (isAbortError(err)) throw err;
+            epList.setStatus("Failed to load episodes: " + errorText(err), "error");
         } finally {
-            if (nav$.isCurrentPanel(panelToken)) {
+            if (!panel.aborted) {
                 setPanelBusy(false);
             }
             nav$.hideDashboardLoading();
@@ -333,11 +344,12 @@ function createTimestampsBrowser(container: HTMLElement): { destroy: () => void 
     }
 
     async function loadMovieEpisodes(show: ShowItem): Promise<void> {
-        const panelToken = nav$.nextPanelVersion();
+        const panel = nextPanel();
+        void actions.loadForSeason(show.Id, show.Id, true, panel).catch(ignoreAbort);
 
         setPanelBusy(true);
         epList.clear();
-        epList.setStatus("Loading timestamps\u2026");
+        epList.setStatus("Loading timestamps…");
         actions.toggle(false);
 
         nav$.showDashboardLoading();
@@ -351,27 +363,27 @@ function createTimestampsBrowser(container: HTMLElement): { destroy: () => void 
             };
 
             const [result, disabledItemIds] = await Promise.all([
-                api.getEpisodeSegments(show.Id),
+                api.getEpisodeSegments(show.Id, panel),
                 // A movie's season-state key is its own ID.
-                getDisabledItemIds(show.Id),
+                getDisabledItemIds(show.Id, panel),
             ]);
-            if (!nav$.isCurrentPanel(panelToken)) return;
 
-            epList.render([movieEp], [result], true, disableOption(disabledItemIds));
+            epList.render({
+                episodes: [movieEp],
+                segments: [result],
+                isMovie: true,
+                disable: disableOption(disabledItemIds),
+                signal: panel,
+            });
             warnDisableStateUnknown(
                 disabledItemIds,
                 "Failed to load media-segment settings; the enable/disable toggle is hidden.",
             );
-            await actions.loadForSeason(show.Id, show.Id, true);
         } catch (err) {
-            if (!nav$.isCurrentPanel(panelToken)) return;
-            epList.setStatus(
-                "Failed to load timestamps: " +
-                    errorText(err),
-                "var(--is-error)",
-            );
+            if (isAbortError(err)) throw err;
+            epList.setStatus("Failed to load timestamps: " + errorText(err), "error");
         } finally {
-            if (nav$.isCurrentPanel(panelToken)) {
+            if (!panel.aborted) {
                 setPanelBusy(false);
             }
             nav$.hideDashboardLoading();
@@ -391,7 +403,7 @@ function createTimestampsBrowser(container: HTMLElement): { destroy: () => void 
 
     function warnDisableStateUnknown(disabledItemIds: string[] | null, message: string): void {
         if (disabledItemIds === null) {
-            epList.setStatus(message, "var(--is-error)");
+            epList.setStatus(message, "error");
         }
     }
 
@@ -410,11 +422,11 @@ function createTimestampsBrowser(container: HTMLElement): { destroy: () => void 
         if (epList.hasUnsavedEdits()) {
             epList.setStatus(
                 "Results changed on the server. An editor has unsaved changes.",
-                "var(--is-warning)",
+                "warning",
                 {
                     label: "Refresh",
                     onClick: () => {
-                        void refreshEpisodes().catch(console.error);
+                        void refreshEpisodes().catch(ignoreAbort);
                     },
                 },
             );
@@ -425,7 +437,7 @@ function createTimestampsBrowser(container: HTMLElement): { destroy: () => void 
 
     async function refreshEpisodes(): Promise<void> {
         const state = nav$.getState();
-        if (!nav$.isAlive() || state.view !== "episodes") return;
+        if (signal.aborted || state.view !== "episodes") return;
 
         const { show, seasonId, seasonName } = state;
         if (show.Type === "Movie") {
@@ -434,7 +446,7 @@ function createTimestampsBrowser(container: HTMLElement): { destroy: () => void 
         }
 
         const season: SeasonItem = { Id: seasonId, Name: seasonName, IndexNumber: null };
-        await loadSeasonEpisodes(show, season);
+        await loadSeasonEpisodes(show, season, currentSeasons);
     }
 
     function updateBreadcrumbs(): void {
@@ -446,7 +458,7 @@ function createTimestampsBrowser(container: HTMLElement): { destroy: () => void 
             onClick:
                 state.view !== "libraries"
                     ? () => {
-                          void navigateToLibraries().catch(console.error);
+                          void navigateToLibraries().catch(ignoreAbort);
                       }
                     : undefined,
         });
@@ -460,7 +472,7 @@ function createTimestampsBrowser(container: HTMLElement): { destroy: () => void 
                 onClick:
                     state.view !== "shows"
                         ? () => {
-                              void navigateToShows(libId, libName).catch(console.error);
+                              void navigateToShows(libId, libName).catch(ignoreAbort);
                           }
                         : undefined,
             });
@@ -473,7 +485,7 @@ function createTimestampsBrowser(container: HTMLElement): { destroy: () => void 
                 onClick:
                     show.Type !== "Movie"
                         ? () => {
-                              void navigateToShow(show).catch(console.error);
+                              void navigateToShow(show).catch(ignoreAbort);
                           }
                         : undefined,
             });
@@ -485,14 +497,4 @@ function createTimestampsBrowser(container: HTMLElement): { destroy: () => void 
 
         nav.updateSegments(segments);
     }
-
-    return {
-        destroy() {
-            nav$.destroy();
-            nav.destroy();
-            epList.destroy();
-            actions.destroy();
-            setPanelBusy(false);
-        },
-    };
 }

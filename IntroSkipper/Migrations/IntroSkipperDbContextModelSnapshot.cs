@@ -29,6 +29,9 @@ namespace IntroSkipper.Migrations
                         .IsRequired()
                         .HasColumnType("TEXT");
 
+                    b.Property<long?>("FileVersion")
+                        .HasColumnType("INTEGER");
+
                     b.HasKey("ItemId", "Type");
 
                     b.ToTable("AnalyzedItems", (string)null);
@@ -39,12 +42,7 @@ namespace IntroSkipper.Migrations
                     b.Property<Guid>("ItemId")
                         .HasColumnType("TEXT");
 
-                    b.Property<Guid>("SeasonId")
-                        .HasColumnType("TEXT");
-
                     b.HasKey("ItemId");
-
-                    b.HasIndex("SeasonId");
 
                     b.ToTable("DisabledItems", (string)null);
                 });
@@ -129,6 +127,31 @@ namespace IntroSkipper.Migrations
                     b.HasIndex("NextAttemptAt");
 
                     b.ToTable("ProjectionQueue", (string)null);
+                });
+
+            modelBuilder.Entity("IntroSkipper.Db.DbSeasonAnalysisOverride", b =>
+                {
+                    b.Property<Guid>("SeasonId")
+                        .HasColumnType("TEXT");
+
+                    b.Property<int?>("AnalysisLengthLimit")
+                        .HasColumnType("INTEGER");
+
+                    b.Property<int?>("AnalysisPercent")
+                        .HasColumnType("INTEGER");
+
+                    b.Property<bool?>("PreviewFromCreditsEnd")
+                        .HasColumnType("INTEGER");
+
+                    b.Property<bool?>("SubtitlePreviewDetection")
+                        .HasColumnType("INTEGER");
+
+                    b.Property<bool?>("SubtitleRecapDetection")
+                        .HasColumnType("INTEGER");
+
+                    b.HasKey("SeasonId");
+
+                    b.ToTable("SeasonAnalysisOverrides", (string)null);
                 });
 
             modelBuilder.Entity("IntroSkipper.Db.DbSeasonState", b =>

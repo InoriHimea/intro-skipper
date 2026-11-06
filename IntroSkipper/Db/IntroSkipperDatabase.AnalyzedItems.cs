@@ -10,9 +10,20 @@ namespace IntroSkipper.Db;
 /// <summary>
 /// Per-item analysis record (<see cref="DbAnalyzedItem"/>) operations of <see cref="IntroSkipperDatabase"/>.
 /// </summary>
-internal sealed partial class IntroSkipperDatabase
+public sealed partial class IntroSkipperDatabase
 {
-    /// <inheritdoc/>
+    /// <summary>
+    /// Re-stamps completed analysis and its active automatic segments from one hash to
+    /// another in one transaction, for the 10.11 adoption and the chapter source check. Only
+    /// records still carrying the previous hash are updated; missing or reset records are
+    /// never recreated. Segment payloads stay unchanged.
+    /// </summary>
+    /// <param name="mode">Analysis mode.</param>
+    /// <param name="itemIds">Previously completed item IDs.</param>
+    /// <param name="previousHash">The hash the records carry now.</param>
+    /// <param name="currentHash">The hash the pass would write for them.</param>
+    /// <param name="cancellationToken">Cancellation token.</param>
+    /// <returns>The number of completion records updated.</returns>
     public async Task<int> UpgradeAnalysisHashAsync(
         AnalysisMode mode,
         IReadOnlyCollection<Guid> itemIds,
@@ -53,33 +64,83 @@ internal sealed partial class IntroSkipperDatabase
         }
     }
 
-    /// <inheritdoc/>
-    public async Task MarkItemsAnalyzedAsync(AnalysisMode mode, IEnumerable<Guid> itemIds, string configHash, CancellationToken cancellationToken = default)
+    /// <summary>
+    /// Records the items as analyzed for the mode under the given configuration hash and
+    /// each item's file version, whether or not segments were found, replacing any earlier
+    /// record of the same item and mode. Queue verification treats a matching record as
+    /// settled (<c>Analyzed</c> with segments, <c>NoSegments</c> without) and a missing or
+    /// mismatching one as <c>NotAnalyzed</c>.
+    /// </summary>
+    /// <param name="mode">Analysis mode.</param>
+    /// <param name="items">Items that were analyzed, each with the file version it was analyzed at (null when unknown).</param>
+    /// <param name="configHash">Configuration hash used for the analysis.</param>
+    /// <param name="cancellationToken">Cancellation token.</param>
+    /// <returns>A <see cref="Task"/> representing the asynchronous operation.</returns>
+    public Task MarkItemsAnalyzedAsync(AnalysisMode mode, IEnumerable<(Guid ItemId, long? FileVersion)> items, string configHash, CancellationToken cancellationToken = default)
     {
-        var ids = itemIds.Distinct().ToArray();
-        if (ids.Length == 0)
+        var rows = items.DistinctBy(item => item.ItemId).ToArray();
+        if (rows.Length == 0)
         {
-            return;
+            return Task.CompletedTask;
         }
 
+        // {0} binds the mode and {1} the hash once per statement; every row reuses them.
+        var statements = MultiRowSql.Statements(
+            rows,
+            item => [item.ItemId, item.FileVersion],
+            p => $"({p[0]}, {{0}}, {{1}}, {p[1]})",
+            values => $"""
+                INSERT INTO "AnalyzedItems" ("ItemId", "Type", "ConfigHash", "FileVersion")
+                VALUES {values}
+                ON CONFLICT("ItemId", "Type") DO UPDATE SET "ConfigHash" = excluded."ConfigHash", "FileVersion" = excluded."FileVersion"
+                """,
+            (int)mode,
+            configHash);
+        return ExecuteInTransactionAsync(statements, cancellationToken);
+    }
+
+    /// <summary>
+    /// Stamps the given file version on every analysis record of each item that has none
+    /// yet. Records written before versioning match any file; stamping them with the
+    /// version seen at verification lets a later replacement of the file be noticed.
+    /// Records that already carry a version are left alone.
+    /// </summary>
+    /// <param name="fileVersionsByItem">The file version to stamp on each item's unversioned records.</param>
+    /// <param name="cancellationToken">Cancellation token.</param>
+    /// <returns>A <see cref="Task"/> representing the asynchronous operation.</returns>
+    public Task BackfillFileVersionsAsync(IReadOnlyDictionary<Guid, long> fileVersionsByItem, CancellationToken cancellationToken = default)
+    {
+        if (fileVersionsByItem.Count == 0)
+        {
+            return Task.CompletedTask;
+        }
+
+        // A VALUES table exposes its columns as column1, column2 in SQLite, in the order
+        // the row lambda binds them.
+        var statements = MultiRowSql.Statements(
+            fileVersionsByItem,
+            item => [item.Key, item.Value],
+            p => $"({p[0]}, {p[1]})",
+            values => $"""
+                UPDATE "AnalyzedItems" SET "FileVersion" = "v"."column2"
+                FROM (VALUES {values}) AS "v"
+                WHERE "AnalyzedItems"."ItemId" = "v"."column1" AND "AnalyzedItems"."FileVersion" IS NULL
+                """);
+        return ExecuteInTransactionAsync(statements, cancellationToken);
+    }
+
+    /// <summary>
+    /// Runs the chunked statements of one analysis-record write in a single transaction,
+    /// so a cancelled pass cannot leave a season half-recorded.
+    /// </summary>
+    private async Task ExecuteInTransactionAsync(IEnumerable<FormattableString> statements, CancellationToken cancellationToken)
+    {
         await InitializeAsync().ConfigureAwait(false);
         using var db = _contextFactory.CreateDbContext();
 
-        // One transaction so a cancelled pass cannot leave the season half-recorded.
         var transaction = await db.Database.BeginTransactionAsync(cancellationToken).ConfigureAwait(false);
         await using (transaction.ConfigureAwait(false))
         {
-            // {0} binds the mode and {1} the hash once per statement; every row reuses them.
-            var statements = MultiRowSql.Statements(
-                ids,
-                id => $"({id}, {{0}}, {{1}})",
-                rows => $"""
-                    INSERT INTO "AnalyzedItems" ("ItemId", "Type", "ConfigHash")
-                    VALUES {rows}
-                    ON CONFLICT("ItemId", "Type") DO UPDATE SET "ConfigHash" = excluded."ConfigHash"
-                    """,
-                (int)mode,
-                configHash);
             foreach (var statement in statements)
             {
                 await db.Database.ExecuteSqlAsync(statement, cancellationToken).ConfigureAwait(false);
