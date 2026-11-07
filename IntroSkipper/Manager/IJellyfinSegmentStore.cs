@@ -34,6 +34,19 @@ internal interface IJellyfinSegmentStore
     Task<IReadOnlyList<MediaSegmentDto>> GetOwnSegmentsAsync(Guid itemId, CancellationToken cancellationToken);
 
     /// <summary>
+    /// Reads which of an item's typed segment rows in Jellyfin's table another provider
+    /// wrote, by row id. Answers the playback path's attribution question — "did this
+    /// plugin write this row?" — without trusting the row's boundaries: an id absent
+    /// from the result is either this plugin's own row or not persisted in Jellyfin's
+    /// table at all, and callers treat both the same.
+    /// </summary>
+    /// <param name="itemId">The item id.</param>
+    /// <param name="type">The segment type to read.</param>
+    /// <param name="cancellationToken">Cancellation token.</param>
+    /// <returns>The ids of the item's rows of that type whose provider is not Intro Skipper.</returns>
+    Task<IReadOnlySet<Guid>> GetForeignSegmentIdsAsync(Guid itemId, MediaSegmentType type, CancellationToken cancellationToken);
+
+    /// <summary>
     /// Retrieves a segment by id alone — any item, any provider. The resolution read
     /// for external deletes, which must tell a missing row apart from one owned by
     /// another item before any validation can happen.

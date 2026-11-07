@@ -1,15 +1,17 @@
 # Intro Skipper — Inori fork
 
 > [!IMPORTANT]
-> **这是非官方维护分支，不是上游发布包。** 已同步上游 `12.0` 分支至 `223a086`（包含 `12.0/v12.0.6.0` 及其后续更新），包含两项补丁：
+> **这是非官方维护分支，不是上游发布包。** 已同步上游 `12.0` 分支至 `223a086`（包含 `12.0/v12.0.6.0` 及其后续更新），包含三项补丁：
 >
 > 1. **片尾保留缓冲**：设置 `IntroEndOffset=5` 且媒体时长已知时，播放 API 返回的片尾跳转终点不晚于媒体结束前 5 秒；已有更长间隙不延长。不改检测结果、数据库或分析 hash。
 > 2. **社区时间点补充**（默认关闭）：本地分析找不到片头/片尾时，从 IntroDB、TheIntroDB 补充，并照常应用偏移设置。本地结果始终优先；关闭时分析 hash 不变。
+> 3. **外源片头终点偏移**：其他提供者写入的播放 `Intro` 行也应用 `IntroStartOffset`/`IntroEndOffset`，本插件自己的行不再重复扣减。只改播放响应，不改数据库、不清理他人片段。
 >
 > 未据本地测试声称已完成群晖/Infuse 实际播放验收。
 
 - [片尾保留补丁说明、90 秒示例与复测方法](patches/outro-tail/README.md)
 - [社区时间点补充说明](patches/community-fallback/README.md)
+- [外源片头终点偏移说明](patches/intro-offset/README.md)
 - [本 fork 的版本发布](https://github.com/InoriHimea/intro-skipper/releases)
 - [上游原始项目](https://github.com/intro-skipper/intro-skipper)
 

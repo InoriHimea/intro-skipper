@@ -27,6 +27,7 @@ internal sealed class FakeJellyfinSegmentStore : IJellyfinSegmentStore
     private readonly object _mirrorLock = new();
     private int _writeCount;
     private int _gatedWriteParked;
+    private int _foreignSegmentIdReadCount;
     private Dictionary<Guid, List<MediaSegmentDto>>? _mirrorRows;
 
     /// <summary>
@@ -49,6 +50,12 @@ internal sealed class FakeJellyfinSegmentStore : IJellyfinSegmentStore
 
     /// <summary>Gets or sets the exception every lookup by id throws.</summary>
     public Exception? FindSegmentException { get; set; }
+
+    /// <summary>Gets or sets the exception the foreign-id read throws.</summary>
+    public Exception? ForeignSegmentIdException { get; set; }
+
+    /// <summary>Gets the number of foreign-id reads performed.</summary>
+    public int ForeignSegmentIdReadCount => _foreignSegmentIdReadCount;
 
     public TaskCompletionSource? WriteGate { get; init; }
 
@@ -93,6 +100,22 @@ internal sealed class FakeJellyfinSegmentStore : IJellyfinSegmentStore
         {
             return Task.FromResult<IReadOnlyList<MediaSegmentDto>>(
                 MirrorRows.TryGetValue(itemId, out var rows) ? [.. rows] : []);
+        }
+    }
+
+    public Task<IReadOnlySet<Guid>> GetForeignSegmentIdsAsync(Guid itemId, MediaSegmentType type, CancellationToken cancellationToken)
+    {
+        Interlocked.Increment(ref _foreignSegmentIdReadCount);
+        ThrowIfConfigured(ForeignSegmentIdException);
+        lock (_mirrorLock)
+        {
+            var ownIds = (MirrorRows.TryGetValue(itemId, out var rows) ? rows : [])
+                .Select(segment => segment.Id)
+                .ToHashSet();
+            return Task.FromResult<IReadOnlySet<Guid>>(ForeignSegments.Values
+                .Where(segment => segment.ItemId == itemId && segment.Type == type && !ownIds.Contains(segment.Id))
+                .Select(segment => segment.Id)
+                .ToHashSet());
         }
     }
 

@@ -52,7 +52,7 @@ returnedEnd = min(originalEnd, cap)
 - 原结束点早于 cap 时不延长；被改 DTO 与包装创建副本，不改共享输入对象。
 - 裁剪后 `End <= Start` 的片尾只从该播放响应排除，不删除存储行。
 - 保留 segment ID、item ID、类型、起点和分页元数据；单纯裁剪不减少总记录数。
-- `Intro`、`Recap`、`Preview`、`Commercial` 与编辑 GET/写接口不变。
+- `Intro`、`Recap`、`Preview`、`Commercial` 与编辑 GET/写接口不变。**注意**：同一响应上的 [外源片头终点偏移补丁](../intro-offset/README.md) 会改写其他提供者写入的 `Intro` 行；那是独立规则，不影响本补丁对 `Outro` 的处理。
 - 不依赖首集过滤开关，不执行 FFmpeg，不写数据库，不更改分析/投影/提供者。
 - 配置 <=0、插件不可用、时长未知/无效、非成功/未知响应透传；不能声称这些情况也保证尾部缓冲。
 

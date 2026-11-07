@@ -5,6 +5,7 @@ using System.Collections.Generic;
 using System.Linq;
 using System.Reflection;
 using System.Threading.Tasks;
+using IntroSkipper.Manager;
 using Jellyfin.Database.Implementations.Enums;
 using MediaBrowser.Controller.Library;
 using MediaBrowser.Model.MediaSegments;
@@ -106,12 +107,19 @@ namespace IntroSkipper.Tests
             await Next(0);
         }
 
-        internal static async Task RunRegisteredFiltersAsync(ResultExecutingContext context, ILibraryManager libraryManager)
+        internal static async Task RunRegisteredFiltersAsync(
+            ResultExecutingContext context,
+            ILibraryManager libraryManager,
+            IJellyfinSegmentStore? segmentStore = null)
         {
             var services = new ServiceCollection();
             services.AddLogging();
             services.AddSingleton(libraryManager);
             new PluginServiceRegistrator().RegisterServices(services, null!);
+            // The playback filters read Jellyfin's MediaSegments table through the store;
+            // registered last so it wins over the production store that needs a server DB.
+            var store = segmentStore ?? new FakeJellyfinSegmentStore();
+            services.AddSingleton(store);
             using var provider = services.BuildServiceProvider();
             var model = CreateModel(typeof(Jellyfin.Api.Controllers.MediaSegmentsController));
             foreach (var convention in provider.GetRequiredService<IOptions<MvcOptions>>().Value.Conventions)

@@ -186,6 +186,29 @@ public sealed class TestJellyfinSegmentStore
     }
 
     [Fact]
+    public async Task GetForeignSegmentIdsAsync_ReturnsOtherProvidersRowsOfThatItemAndType()
+    {
+        using var db = new TempJellyfinDb();
+        var store = CreateStore(db);
+        var itemId = Guid.NewGuid();
+        var foreignIntro = CreateEntity(itemId, MediaSegmentType.Intro, 2496, 92496, ForeignProviderId);
+        var foreignOutro = CreateEntity(itemId, MediaSegmentType.Outro, 0, 100, ForeignProviderId);
+        await SeedAsync(
+            db,
+            foreignIntro,
+            foreignOutro,
+            CreateEntity(itemId, MediaSegmentType.Intro, 5000, 85000, JellyfinSegmentStore.ProviderId),
+            CreateEntity(Guid.NewGuid(), MediaSegmentType.Intro, 0, 100, ForeignProviderId));
+
+        // Attribution for the playback path: only other providers' rows, only this item,
+        // only the requested type. Own rows are what the caller must not re-offset.
+        var ids = await store.GetForeignSegmentIdsAsync(itemId, MediaSegmentType.Intro, CancellationToken.None);
+
+        Assert.Equal(new[] { foreignIntro.Id }, ids);
+        Assert.Empty(await store.GetForeignSegmentIdsAsync(Guid.NewGuid(), MediaSegmentType.Intro, CancellationToken.None));
+    }
+
+    [Fact]
     public async Task FindSegmentAsync_ReturnsAllFields_AcrossItemsAndProviders()
     {
         using var db = new TempJellyfinDb();

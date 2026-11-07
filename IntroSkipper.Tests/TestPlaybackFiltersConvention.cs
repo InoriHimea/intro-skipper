@@ -3,6 +3,7 @@
 using System;
 using System.Linq;
 using IntroSkipper.Filters;
+using IntroSkipper.Manager;
 using Microsoft.AspNetCore.Mvc;
 using Microsoft.AspNetCore.Mvc.ApplicationModels;
 using Microsoft.Extensions.DependencyInjection;
@@ -11,15 +12,16 @@ using Xunit;
 
 namespace IntroSkipper.Tests;
 
-public class TestPlaybackOutroTailFilterConvention
+public class TestPlaybackFiltersConvention
 {
     [Fact]
     public void NativePlaybackGetIsMatched()
     {
         var model = PlaybackFilterTestHelpers.CreateModel(typeof(Jellyfin.Api.Controllers.MediaSegmentsController));
-        new PlaybackOutroTailFilterConvention().Apply(model);
-        var filter = Assert.IsType<ServiceFilterAttribute>(Assert.Single(model.Controllers[0].Actions[0].Filters));
-        Assert.Equal(typeof(PlaybackOutroTailFilter), filter.ServiceType);
+        new PlaybackFiltersConvention().Apply(model);
+        Assert.Equal(
+            new[] { typeof(PlaybackIntroOffsetFilter), typeof(PlaybackOutroTailFilter) },
+            model.Controllers[0].Actions[0].Filters.OfType<ServiceFilterAttribute>().Select(filter => filter.ServiceType));
     }
 
     [Theory]
@@ -28,7 +30,7 @@ public class TestPlaybackOutroTailFilterConvention
     public void SimilarControllerAndEditorAreNotMatched(Type controllerType)
     {
         var model = PlaybackFilterTestHelpers.CreateModel(controllerType);
-        new PlaybackOutroTailFilterConvention().Apply(model);
+        new PlaybackFiltersConvention().Apply(model);
         Assert.Empty(model.Controllers[0].Actions[0].Filters);
     }
 
@@ -41,7 +43,7 @@ public class TestPlaybackOutroTailFilterConvention
     public void NonGetSelectorsAreNotMatched(string method)
     {
         var model = PlaybackFilterTestHelpers.CreateModel(typeof(Jellyfin.Api.Controllers.MediaSegmentsController), httpMethod: method);
-        new PlaybackOutroTailFilterConvention().Apply(model);
+        new PlaybackFiltersConvention().Apply(model);
         Assert.Empty(model.Controllers[0].Actions[0].Filters);
     }
 
@@ -49,12 +51,12 @@ public class TestPlaybackOutroTailFilterConvention
     public void DifferentActionAndMissingHttpConstraintAreNotMatched()
     {
         var model = PlaybackFilterTestHelpers.CreateModel(typeof(Jellyfin.Api.Controllers.MediaSegmentsController), "SaveSegments");
-        new PlaybackOutroTailFilterConvention().Apply(model);
+        new PlaybackFiltersConvention().Apply(model);
         Assert.Empty(model.Controllers[0].Actions[0].Filters);
 
         model = PlaybackFilterTestHelpers.CreateModel(typeof(Jellyfin.Api.Controllers.MediaSegmentsController));
         model.Controllers[0].Actions[0].Selectors[0].ActionConstraints.Clear();
-        new PlaybackOutroTailFilterConvention().Apply(model);
+        new PlaybackFiltersConvention().Apply(model);
         Assert.Empty(model.Controllers[0].Actions[0].Filters);
     }
 
@@ -82,7 +84,7 @@ public class TestPlaybackOutroTailFilterConvention
             action.Parameters.Add(new ParameterModel(method.GetParameters()[0], []) { ParameterName = "itemId", Action = action });
         }
 
-        new PlaybackOutroTailFilterConvention().Apply(model);
+        new PlaybackFiltersConvention().Apply(model);
         Assert.Empty(action.Filters);
     }
 
@@ -91,8 +93,8 @@ public class TestPlaybackOutroTailFilterConvention
     {
         var model = PlaybackFilterTestHelpers.CreateModel(typeof(Jellyfin.Api.Controllers.MediaSegmentsController));
         new MediaSegmentsFilterConvention().Apply(model);
-        new PlaybackOutroTailFilterConvention().Apply(model);
-        Assert.Equal(new[] { typeof(MediaSegmentsFirstEpisodeFilter), typeof(PlaybackOutroTailFilter) },
+        new PlaybackFiltersConvention().Apply(model);
+        Assert.Equal(new[] { typeof(MediaSegmentsFirstEpisodeFilter), typeof(PlaybackIntroOffsetFilter), typeof(PlaybackOutroTailFilter) },
             model.Controllers[0].Actions[0].Filters.OfType<ServiceFilterAttribute>().Select(filter => filter.ServiceType));
     }
 
@@ -103,11 +105,16 @@ public class TestPlaybackOutroTailFilterConvention
         services.AddLogging();
         services.AddSingleton(EntrypointTestHelpers.CreateLibraryManager());
         new PluginServiceRegistrator().RegisterServices(services, null!);
+        // Resolving the playback filters needs the attribution read; the production store
+        // wants a server database, so the fake stands in for it here.
+        services.AddSingleton<IJellyfinSegmentStore>(new FakeJellyfinSegmentStore());
         Assert.Equal(ServiceLifetime.Singleton, Assert.Single(services, descriptor => descriptor.ServiceType == typeof(PlaybackOutroTailFilter)).Lifetime);
+        Assert.Equal(ServiceLifetime.Singleton, Assert.Single(services, descriptor => descriptor.ServiceType == typeof(PlaybackIntroOffsetFilter)).Lifetime);
         using var provider = services.BuildServiceProvider();
         Assert.Same(provider.GetRequiredService<PlaybackOutroTailFilter>(), provider.GetRequiredService<PlaybackOutroTailFilter>());
+        Assert.Same(provider.GetRequiredService<PlaybackIntroOffsetFilter>(), provider.GetRequiredService<PlaybackIntroOffsetFilter>());
         var conventions = provider.GetRequiredService<IOptions<MvcOptions>>().Value.Conventions;
-        Assert.Single(conventions.OfType<PlaybackOutroTailFilterConvention>());
+        Assert.Single(conventions.OfType<PlaybackFiltersConvention>());
         Assert.Single(conventions.OfType<MediaSegmentsFilterConvention>());
     }
 

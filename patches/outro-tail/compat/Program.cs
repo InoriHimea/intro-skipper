@@ -100,7 +100,7 @@ try
     using var provider = services.BuildServiceProvider();
     var filter = (IAsyncResultFilter)provider.GetRequiredService(filterType);
     Require(ReferenceEquals(filter, provider.GetRequiredService(filterType)), "Filter is not a singleton");
-    var conventionType = pluginAssembly.GetType("IntroSkipper.Filters.PlaybackOutroTailFilterConvention", true)!;
+    var conventionType = pluginAssembly.GetType("IntroSkipper.Filters.PlaybackFiltersConvention", true)!;
     var convention = (IApplicationModelConvention)Activator.CreateInstance(conventionType, nonPublic: true)!;
     var nativeType = apiAssembly.GetType("Jellyfin.Api.Controllers.MediaSegmentsController", true)!;
     var nativeMethod = nativeType.GetMethod("GetItemSegments")!;
@@ -123,6 +123,7 @@ try
     application.Controllers.Add(controller);
     convention.Apply(application);
     Require(action.Filters.OfType<ServiceFilterAttribute>().Count(attribute => attribute.ServiceType == filterType) == 1, "Real host playback action was not matched");
+    Require(action.Filters.OfType<ServiceFilterAttribute>().Count(attribute => attribute.ServiceType.Name == "PlaybackIntroOffsetFilter") == 1, "Intro offset filter was not attached to the real host playback action");
     action.Selectors.Clear();
     var postSelector = new SelectorModel();
     postSelector.ActionConstraints.Add(new HttpMethodActionConstraint(["POST"]));

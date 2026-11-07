@@ -116,6 +116,29 @@ internal sealed partial class JellyfinSegmentStore(
         }
     }
 
+    /// <inheritdoc />
+    public async Task<IReadOnlySet<Guid>> GetForeignSegmentIdsAsync(Guid itemId, MediaSegmentType type, CancellationToken cancellationToken)
+    {
+        var db = await contextFactory.CreateDbContextAsync(cancellationToken).ConfigureAwait(false);
+        await using (db.ConfigureAwait(false))
+        {
+            // Scoped to everything but this plugin's provider id, in one roundtrip. A
+            // row this plugin wrote and Jellyfin has not persisted yet (mirroring off,
+            // projection pending) is absent here, which is exactly how the playback
+            // path wants it: unattributed rows keep their boundaries.
+            var ids = await db.MediaSegments
+                .AsNoTracking()
+                .Where(segment => segment.ItemId == itemId
+                    && segment.Type == type
+                    && segment.SegmentProviderId != ProviderId)
+                .Select(segment => segment.Id)
+                .ToListAsync(cancellationToken)
+                .ConfigureAwait(false);
+
+            return ids.ToHashSet();
+        }
+    }
+
     private static IQueryable<MediaSegment> OwnSegments(JellyfinDbContext db, Guid itemId)
         => db.MediaSegments.Where(segment => segment.ItemId == itemId && segment.SegmentProviderId == ProviderId);
 

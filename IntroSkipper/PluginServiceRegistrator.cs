@@ -98,10 +98,11 @@ namespace IntroSkipper
             serviceCollection.AddSingleton<ISegmentEraser, SegmentEraser>();
             serviceCollection.AddSingleton<MediaSegmentsFirstEpisodeFilter>();
             serviceCollection.AddSingleton<PlaybackOutroTailFilter>();
+            serviceCollection.AddSingleton<PlaybackIntroOffsetFilter>();
             serviceCollection.Configure<MvcOptions>(options =>
             {
                 options.Conventions.Add(new MediaSegmentsFilterConvention());
-                options.Conventions.Add(new PlaybackOutroTailFilterConvention());
+                options.Conventions.Add(new PlaybackFiltersConvention());
             });
         }
     }

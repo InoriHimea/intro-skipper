@@ -27,7 +27,7 @@ public sealed class PlaybackOutroTailFilter(ILibraryManager libraryManager) : IA
         if (keepSeconds <= 0 ||
             !HttpMethods.IsGet(context.HttpContext.Request.Method) ||
             context.ActionDescriptor is not ControllerActionDescriptor action ||
-            !PlaybackOutroTailFilterConvention.IsPlaybackAction(action.ControllerTypeInfo, action.ActionName))
+            !PlaybackSegmentsAction.IsNativePlayback(action.ControllerTypeInfo, action.ActionName))
         {
             await next().ConfigureAwait(false);
             return;
