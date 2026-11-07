@@ -10,6 +10,7 @@
 | 上游提交 | `223a0860535f24744ee164bd3797976b6aa3d685` |
 | 补丁分支 | `inori/community-fallback`（含片尾保留、社区补充与本补丁） |
 | 程序集 / 文件版本 | `12.0.6.0`，保持原插件身份 |
+| 补丁发行标签 | `12.0/v12.0.6.0-inori-introffset.1`（GitHub Actions 构建，未签名，源提交 `d283b6b`） |
 | 新增生产文件 | `Filters/PlaybackIntroOffsetFilter.cs`、`Filters/PlaybackIntroOffsets.cs`、`Filters/PlaybackSegmentsAction.cs` |
 | 修改生产文件 | `Filters/PlaybackFiltersConvention.cs`（原 `PlaybackOutroTailFilterConvention.cs` 更名并同时挂载两个过滤器）、`Filters/PlaybackOutroTailFilter.cs`、`Manager/IJellyfinSegmentStore.cs`、`Manager/JellyfinSegmentStore.cs`、`PluginServiceRegistrator.cs` |
 
@@ -63,11 +64,13 @@ end <= start 时该行只从本次响应移除
 
 ## 验证范围
 
-2026-11-07 本地：
+2026-11-07 本地与 GitHub CI：
 
 - `dotnet build`（`-p:SkipWebBuild=true`）零警告通过（`TreatWarningsAsErrors` + StyleCop）。
 - 播放/存储定向用例 110 项通过，覆盖：真实 Bokurano 数值 `2.496–92.496 → 7.496–87.496`、吸附起点两种开关、时长裁剪、未知时长、负偏移、整行被扣空后的移除、分页元数据、原 DTO 不被修改、`JsonResult` 元数据保留、归属查询抛错时透传、非 GET/非 200/非原生控制器/缺路由 id 时零查询、与片尾保留及首集过滤器在同一注册管线内的组合、真实 `JellyfinDbContext` 上 `GetForeignSegmentIdsAsync` 的提供者/条目/类型过滤。
 - 全量 `dotnet test` 1558 通过、8 失败，失败全部集中在 `TestAudioFingerprinting`、`TestFFmpegService`、`TestCreditsRunner`，原因是本机 Homebrew `ffmpeg 8.0.1` 无 `chromaprint` filter（`ffmpeg -filters | grep chromaprint` 为 0），与本补丁路径无关。
+- GitHub Actions `Fork Release` 14 步全部通过：恢复、`jellyfin-ffmpeg 8.1.3` 安装、**完整测试套件**、Release 构建、打包、发布、上传。Linux CI 的 ffmpeg 带 chromaprint，本机缺失导致的 8 项失败在 CI 未出现。
+- 发行运行 `42386559583`（提交 `d283b6b`）：资产已回下载，`shasum -a 256 -c SHA256SUMS.txt` 两项均 OK；DLL 大小 1172992 字节，SHA256 `32778ff239b6c7a45e905a61065f0843471763964e9a0ecdae75d0e22f5139fa`，内部 `CommitHash` 为 `d283b6b0f3c1a2efa966434203406c989dab187f`。
 - 未部署、未重启、未改服务器配置；真实客户端跳转与 API 输出仍待验收。
 
 ## 复测
@@ -76,5 +79,7 @@ end <= start 时该行只从本次响应移除
 dotnet test IntroSkipper.Tests/IntroSkipper.Tests.csproj -p:SkipWebBuild=true \
   --filter "FullyQualifiedName~TestPlaybackIntroOffsetFilter|FullyQualifiedName~TestPlaybackFiltersConvention|FullyQualifiedName~TestPlaybackOutroTail|FullyQualifiedName~TestJellyfinSegmentStore"
 ```
+
+重新发行：`gh workflow run "Fork Release" --repo InoriHimea/intro-skipper --ref inori/outro-tail-5s -f tag='12.0/v12.0.6.0-inori-introffset.N'`。该 workflow 不改版本号、不签名、不派发 manifest、不在上游发布线上打标签。
 
 不连接或修改任何运行中的 Jellyfin 服务。

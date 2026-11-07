@@ -15,7 +15,7 @@
 - [本 fork 的版本发布](https://github.com/InoriHimea/intro-skipper/releases)
 - [上游原始项目](https://github.com/intro-skipper/intro-skipper)
 
-补丁发行标签独立于程序集版本；历史发行例如 `12.0/v12.0.4.0-inori-tail5s.1`。当前源码生成的 DLL 仍为 `IntroSkipper.dll`，程序集/文件版本随上游更新为 `12.0.6.0`。请按 Release 标签、源码提交和 SHA256 区分本地补丁与同版本官方 DLL。下方保留上游介绍、署名和许可；其中上游徽章、签名和 manifest 不代表本 fork 的验证或签名，官方 manifest 也不会安装本补丁。
+补丁发行标签独立于程序集版本；历史发行例如 `12.0/v12.0.4.0-inori-tail5s.1`，当前含三项补丁的发行是 `12.0/v12.0.6.0-inori-introffset.1`（由 fork 的 `Fork Release` workflow 构建，未签名、不派发上游 manifest）。当前源码生成的 DLL 仍为 `IntroSkipper.dll`，程序集/文件版本随上游更新为 `12.0.6.0`。请按 Release 标签、源码提交和 SHA256 区分本地补丁与同版本官方 DLL。下方保留上游介绍、署名和许可；其中上游徽章、签名和 manifest 不代表本 fork 的验证或签名，官方 manifest 也不会安装本补丁。
 
 ## 上游项目说明
 
