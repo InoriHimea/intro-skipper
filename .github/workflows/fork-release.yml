@@ -90,7 +90,8 @@ jobs:
           # Basenames only: the checksum file is verified after download, where the CI
           # build path does not exist.
           cp "$DLL" ./IntroSkipper.dll
-          sha256sum "$ZIP" ./IntroSkipper.dll > SHA256SUMS.txt
+          sha256sum "$ZIP" | sed "s|  .*/|  |" > SHA256SUMS.txt
+          sha256sum ./IntroSkipper.dll | sed "s|  .*/|  |" >> SHA256SUMS.txt
           {
             echo "ZIP=$ZIP"
             echo "DLL=$DLL"
