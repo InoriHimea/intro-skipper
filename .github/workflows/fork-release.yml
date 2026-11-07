@@ -87,7 +87,10 @@ jobs:
           SUFFIX=${RELEASE_TAG#12.0/v${VERSION}-}
           ZIP="intro-skipper-v${VERSION}-${SUFFIX}.zip"
           zip -j "$ZIP" "$DLL"
-          sha256sum "$ZIP" "$DLL" > SHA256SUMS.txt
+          # Basenames only: the checksum file is verified after download, where the CI
+          # build path does not exist.
+          cp "$DLL" ./IntroSkipper.dll
+          sha256sum "$ZIP" ./IntroSkipper.dll > SHA256SUMS.txt
           {
             echo "ZIP=$ZIP"
             echo "DLL=$DLL"
@@ -102,7 +105,7 @@ jobs:
           RELEASE_TAG: ${{ inputs.tag }}
           RELEASE_NOTES: ${{ inputs.notes }}
         run: |
-          ASSETS=("$ZIP" "$DLL" "SHA256SUMS.txt")
+          ASSETS=("$ZIP" "./IntroSkipper.dll" "SHA256SUMS.txt")
           if [[ -n "$RELEASE_NOTES" ]]; then
             gh release create "$RELEASE_TAG" "${ASSETS[@]}" --prerelease \
               --title "$RELEASE_TAG" --notes "$RELEASE_NOTES" --target "${{ github.sha }}"
