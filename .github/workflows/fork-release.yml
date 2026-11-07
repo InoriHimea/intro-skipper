@@ -1,0 +1,121 @@
+name: "Fork Release"
+
+# Fork-only release path. Upstream's release.yml bumps the assembly version, signs
+# with SignPath, tags the upstream release line and commits the bump; none of that
+# fits a private patch build. This workflow builds the current commit unchanged,
+# runs the test suite, and publishes an explicitly non-official release whose assets
+# are distinguishable by tag and SHA256.
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Release tag, e.g. 12.0/v12.0.6.0-inori-introffset.1'
+        required: true
+        type: string
+      notes:
+        description: 'Release notes in Markdown. Empty uses generated notes.'
+        required: false
+        type: string
+
+permissions:
+  contents: write
+
+concurrency:
+  group: fork-release
+  cancel-in-progress: false
+
+jobs:
+  release:
+    # Never run on a mirror of upstream: this publishes a patched DLL.
+    if: ${{ github.repository == 'InoriHimea/intro-skipper' }}
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+
+      - name: Validate tag
+        env:
+          RELEASE_TAG: ${{ inputs.tag }}
+        run: |
+          # The Jellyfin release line leads the tag, matching the existing fork
+          # releases, so a mistyped tag cannot publish into an unrelated line.
+          if [[ ! "$RELEASE_TAG" =~ ^12\.0/v[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+-inori-[a-z0-9.]+$ ]]; then
+            echo "Tag must look like 12.0/v12.0.6.0-inori-<patch>.<n>, got '$RELEASE_TAG'"
+            exit 1
+          fi
+          if git rev-parse -q --verify "refs/tags/$RELEASE_TAG" >/dev/null; then
+            echo "Tag '$RELEASE_TAG' already exists locally"
+            exit 1
+          fi
+
+      - name: Setup build environment
+        uses: ./.github/actions/setup-build-env
+
+      - name: Install jellyfin-ffmpeg
+        run: |
+          sudo apt update
+          . /etc/os-release
+          deb="jellyfin-ffmpeg8_8.1.3-1-${VERSION_CODENAME}_amd64.deb"
+          curl -fsSLO "https://github.com/jellyfin/jellyfin-ffmpeg/releases/download/v8.1.3-1/${deb}"
+          sudo apt install -y "./${deb}"
+          sudo ln -s /usr/lib/jellyfin-ffmpeg/ffmpeg /usr/local/bin/ffmpeg
+          sudo ln -s /usr/lib/jellyfin-ffmpeg/ffprobe /usr/local/bin/ffprobe
+          ffmpeg -version
+
+      - name: Embed commit identification
+        run: |
+          # Same convention as upstream: the built DLL names the commit it came from.
+          sed -i "s/string\.Empty/\"${{ github.sha }}\"/g" IntroSkipper/Helper/Commit.cs
+          grep -n 'CommitHash =>' IntroSkipper/Helper/Commit.cs
+
+      - name: Test
+        run: dotnet test --no-restore --verbosity normal
+
+      - name: Build release
+        run: dotnet build --configuration Release --no-restore
+
+      - name: Package
+        env:
+          RELEASE_TAG: ${{ inputs.tag }}
+        run: |
+          DLL="IntroSkipper/bin/Release/${DOTNET_TFM}/IntroSkipper.dll"
+          test -f "$DLL"
+          VERSION=$(sed -n 's|.*<FileVersion>\(.*\)</FileVersion>.*|\1|p;T;q' IntroSkipper/IntroSkipper.csproj)
+          # 12.0/v12.0.6.0-inori-introffset.1 -> inori-introffset.1
+          SUFFIX=${RELEASE_TAG#12.0/v${VERSION}-}
+          ZIP="intro-skipper-v${VERSION}-${SUFFIX}.zip"
+          zip -j "$ZIP" "$DLL"
+          sha256sum "$ZIP" "$DLL" > SHA256SUMS.txt
+          {
+            echo "ZIP=$ZIP"
+            echo "DLL=$DLL"
+            echo "VERSION=$VERSION"
+            echo "SUFFIX=$SUFFIX"
+          } >> "$GITHUB_ENV"
+          cat SHA256SUMS.txt
+
+      - name: Publish release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          RELEASE_TAG: ${{ inputs.tag }}
+          RELEASE_NOTES: ${{ inputs.notes }}
+        run: |
+          ASSETS=("$ZIP" "$DLL" "SHA256SUMS.txt")
+          if [[ -n "$RELEASE_NOTES" ]]; then
+            gh release create "$RELEASE_TAG" "${ASSETS[@]}" --prerelease \
+              --title "$RELEASE_TAG" --notes "$RELEASE_NOTES" --target "${{ github.sha }}"
+          else
+            gh release create "$RELEASE_TAG" "${ASSETS[@]}" --prerelease \
+              --title "$RELEASE_TAG" --generate-notes --target "${{ github.sha }}"
+          fi
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v7
+        with:
+          name: IntroSkipper-${{ github.sha }}
+          path: |
+            IntroSkipper/bin/Release/${{ env.DOTNET_TFM }}/IntroSkipper.dll
+            SHA256SUMS.txt
+          if-no-files-found: error
