@@ -11,6 +11,9 @@ using System.Text.Unicode;
 using IntroSkipper.Configuration;
 using IntroSkipper.Data;
 using IntroSkipper.Helper;
+using MediaBrowser.Controller.MediaEncoding;
+using MediaBrowser.Controller.Session;
+using MediaBrowser.Model.Configuration;
 using MediaBrowser.Model.Entities;
 using Microsoft.Extensions.Logging;
 using UtfUnknown;
@@ -25,10 +28,11 @@ internal sealed partial class FFmpegService : IFFmpegService
     private const double LimitedRangeLumaMinimum = 16.0;
     private const double LimitedRangeLumaRange = 219.0;
 
-    // Per-frame luma percentiles, mean saturation and luma difference to the frame before.
-    // format=yuv420p brings 10-bit sources to 8-bit values and keeps the source's range, so a
-    // full-range source spans 0 to 255.
-    private const string KeyframeVisualFilters = "format=yuv420p,signalstats,metadata=print";
+    // A cut decode's per-frame luma percentiles, mean saturation and luma difference to the frame
+    // before, which a metadata instance prints. format=yuv420p brings 10-bit sources to 8-bit values
+    // and keeps the source's range, so a full-range source spans 0 to 255. PageFacts measures the
+    // keyframe scan's pages on the same scale from the same format.
+    private const string KeyframeVisualFilters = "format=yuv420p,signalstats";
 
     // VP9/WebM may ignore -skip_frame nokey; filter expensive scans by packet keyframe.
     private const string KeyframeSelect = "select=eq(key\\,1)";
@@ -74,11 +78,11 @@ internal sealed partial class FFmpegService : IFFmpegService
     // HEVC decoder errors of the wavefront path, which slice threads use: it trusts each slice
     // header's entry points, and a stream whose slice segments don't match them decodes as black
     // with exit 0. A slice-threaded scan that logs one is decoded again with frame threads
-    // (RunCachedScanAsync). "Independent slice segment missing." is not among them: healthy
-    // streams with dependent slices log it on every skipped frame.
-    private static readonly string[] SliceStructureErrors = ["entry_point_offset table is corrupted", "WPP ctb addresses are wrong", "Previous slice segment missing"];
+    // (RunCachedScanAsync, ReadRawPagesAsync). "Independent slice segment missing." is not among
+    // them: healthy streams with dependent slices log it on every skipped frame.
+    internal static readonly string[] SliceStructureErrors = ["entry_point_offset table is corrupted", "WPP ctb addresses are wrong", "Previous slice segment missing"];
 
-    // Generous: the probe is five fast ffmpeg info queries, each capped at 2 s of process-exit
+    // Generous: the probe is four fast ffmpeg info queries, each capped at 2 s of process-exit
     // wait (see ProbeFFmpegVersionAsync), so ~8 s covers a healthy run, but the output drain
     // is awaited before that cap applies.
     private static readonly TimeSpan DefaultVersionProbeTimeout = TimeSpan.FromMinutes(2);
@@ -93,23 +97,18 @@ internal sealed partial class FFmpegService : IFFmpegService
         ("-h filter=silencedetect", "noise tolerance", "silencedetect options", "The installed version of ffmpeg does not support the silencedetect filter", "silencedetect_not_supported"),
     ];
 
-    // Probed after the requirements. This filter only feeds keyframe visuals, so a build
-    // without it keeps every other scan and loses card credits detection and the cut start,
-    // which reads the visuals' frame difference.
-    private static readonly (string Filter, string BundleName)[] KeyframeVisualFilterProbes =
-    [
-        ("signalstats", "signalstats options"),
-    ];
-
     private static readonly Encoding Windows1252 = CodePagesEncodingProvider.Instance.GetEncoding(1252)!;
 
     private readonly ILogger<FFmpegService> _logger;
     private readonly DetectionCacheService _cacheService;
     private readonly FFmpegProcessRunner _processRunner;
     private readonly FFmpegVersionGate _versionGate;
+    private readonly Func<EncodingOptions?> _encodingOptions;
+    private readonly IMediaEncoder? _mediaEncoder;
+    private readonly ISessionManager? _sessionManager;
 
     // Results of the probes that several modes repeat, kept for one pass.
-    private readonly EpisodeProbeMemo<string, string> _videoCodecs = new();
+    private readonly EpisodeProbeMemo<string, FFmpegOutputParser.VideoStream> _videoStreams = new();
     private readonly EpisodeProbeMemo<(string Path, string Language, bool PreferMostChannels), AudioStreamSelection> _audioStreamSelections = new();
     private readonly EpisodeProbeMemo<(string Path, string Languages), FFmpegOutputParser.SubtitleStreamListing> _subtitleStreamListings = new();
 
@@ -118,26 +117,39 @@ internal sealed partial class FFmpegService : IFFmpegService
     /// </summary>
     /// <param name="logger">The logger instance.</param>
     /// <param name="cacheService">The detection cache service.</param>
-    public FFmpegService(ILogger<FFmpegService> logger, DetectionCacheService cacheService)
-        : this(logger, cacheService, null, null)
+    /// <param name="mediaEncoder">Reports the hwaccels Jellyfin's ffmpeg supports.</param>
+    /// <param name="sessionManager">Reports the sessions whose video transcodes keep the scans in software.</param>
+    public FFmpegService(ILogger<FFmpegService> logger, DetectionCacheService cacheService, IMediaEncoder mediaEncoder, ISessionManager sessionManager)
+        : this(logger, cacheService, null, null, null, mediaEncoder, sessionManager)
     {
     }
 
     /// <summary>
-    /// Initializes a new instance of the <see cref="FFmpegService"/> class with a replaced version probe (tests only).
+    /// Initializes a new instance of the <see cref="FFmpegService"/> class with a replaced version
+    /// probe, encoding options or Jellyfin services, for tests and CreditsRunner, which run without
+    /// Jellyfin.
     /// </summary>
     /// <param name="logger">The logger instance.</param>
     /// <param name="cacheService">The detection cache service.</param>
     /// <param name="versionProbe">Replaces the ffmpeg version probe; <see langword="null"/> runs the real one.</param>
     /// <param name="versionProbeTimeout">Bounds one probe attempt; <see langword="null"/> uses the default.</param>
+    /// <param name="encodingOptions">Reads the encoding options hardware decode follows, on every scan; <see langword="null"/> reads Jellyfin's.</param>
+    /// <param name="mediaEncoder">Reports the hwaccels Jellyfin's ffmpeg supports; <see langword="null"/> treats every hwaccel as supported.</param>
+    /// <param name="sessionManager">Reports the running sessions; <see langword="null"/> treats no session as transcoding.</param>
     internal FFmpegService(
         ILogger<FFmpegService> logger,
         DetectionCacheService cacheService,
-        Func<CancellationToken, Task<bool>>? versionProbe,
-        TimeSpan? versionProbeTimeout)
+        Func<CancellationToken, Task<bool>>? versionProbe = null,
+        TimeSpan? versionProbeTimeout = null,
+        Func<EncodingOptions?>? encodingOptions = null,
+        IMediaEncoder? mediaEncoder = null,
+        ISessionManager? sessionManager = null)
     {
         _logger = logger;
         _cacheService = cacheService;
+        _encodingOptions = encodingOptions ?? (() => Plugin.Instance?.EncodingOptions);
+        _mediaEncoder = mediaEncoder;
+        _sessionManager = sessionManager;
         _processRunner = new FFmpegProcessRunner(logger);
         _versionGate = new FFmpegVersionGate(
             logger,
@@ -165,7 +177,6 @@ internal sealed partial class FFmpegService : IFFmpegService
             {
                 var output = Encoding.UTF8.GetString(await GetOutputAsync(
                     arguments.Split(' ', StringSplitOptions.RemoveEmptyEntries),
-                    stderr: false,
                     infoQuery: true,
                     timeout: 2000,
                     cancellationToken).ConfigureAwait(false));
@@ -184,18 +195,7 @@ internal sealed partial class FFmpegService : IFFmpegService
                 }
             }
 
-            var visualsSupported = true;
-            foreach (var (filter, bundleName) in KeyframeVisualFilterProbes)
-            {
-                var output = await ProbeAsync("-h filter=" + filter, bundleName).ConfigureAwait(false);
-                if (!output.Contains("Filter " + filter, StringComparison.OrdinalIgnoreCase))
-                {
-                    LogKeyframeVisualFilterUnsupported(_logger, filter);
-                    visualsSupported = false;
-                }
-            }
-
-            return (true, new FFmpegCheckResult("okay", [.. outputs], visualsSupported));
+            return (true, new FFmpegCheckResult("okay", [.. outputs]));
         }
         catch (OperationCanceledException)
         {
@@ -229,7 +229,7 @@ internal sealed partial class FFmpegService : IFFmpegService
          * [silencedetect @ 0x000000000000] silence_start: 12.34
          * [silencedetect @ 0x000000000000] silence_end: 56.123 | silence_duration: 43.783
         */
-        return RunCachedScanAsync(episode, mode, CacheEntryType.Silence, range.Start, range.End, config, args, raw => FFmpegOutputParser.ParseSilence(raw, range.Start), cancellationToken);
+        return RunCachedScanAsync(episode, mode, CacheEntryType.Silence, range.Start, range.End, config, args, hardwareDecodable: false, raw => FFmpegOutputParser.ParseSilence(raw, range.Start), cancellationToken);
     }
 
     /// <inheritdoc/>
@@ -245,135 +245,84 @@ internal sealed partial class FFmpegService : IFFmpegService
         // observe the content's full darkness distribution; other modes keep the amount=50
         // superset that existing cache rows and their callers' post-filters rely on.
         var amount = mode == AnalysisMode.Recap ? 0 : 50;
+        var blackframe = FilterInstance.Draw("blackframe");
         string[] args =
         [
             "-ss", range.Start.ToString(CultureInfo.InvariantCulture),
             "-i", episode.Path,
             "-to", range.Duration.ToString(CultureInfo.InvariantCulture),
             "-an", "-dn", "-sn",
-            "-vf", $"blackframe=amount={amount}:threshold={config.BlackFrameThreshold}",
+            "-vf", $"{blackframe.Name}=amount={amount}:threshold={config.BlackFrameThreshold}",
             "-f", "null", "-",
         ];
 
-        var allFrames = await RunCachedScanAsync(episode, mode, CacheEntryType.BlackFrame, range.Start, range.End, config, args, FFmpegOutputParser.ParseBlackFrames, cancellationToken).ConfigureAwait(false);
+        // Only the recap scan decodes on hardware: the legacy analyzer's scans were not measured there.
+        var allFrames = await RunCachedScanAsync(episode, mode, CacheEntryType.BlackFrame, range.Start, range.End, config, args, hardwareDecodable: mode == AnalysisMode.Recap, raw => FFmpegOutputParser.ParseBlackFrames(raw, blackframe), cancellationToken).ConfigureAwait(false);
         return [.. allFrames.Where(bf => bf.Percentage >= minimum)];
     }
 
     /// <inheritdoc/>
     public async Task<KeyframePage[]> ScanKeyframesAsync(QueuedEpisode episode, PluginConfiguration config, CancellationToken cancellationToken = default)
     {
-        // The black-frame scan goes first: on a cache miss its decode also writes the visuals row,
-        // so the visuals read after it is a cache hit. Run concurrently, a miss would decode twice.
-        var rows = await DetectBlackFramesAsync(episode, config, cancellationToken).ConfigureAwait(false);
-        var visuals = await DetectKeyframeVisualsAsync(episode, config, cancellationToken).ConfigureAwait(false);
-        return KeyframeJoin.Pages(rows, visuals);
-    }
-
-    /// <summary>
-    /// Finds the black percentage of every keyframe from the credits start to the end of the file.
-    /// </summary>
-    /// <remarks>
-    /// A cache miss is one keyframe scan: it also caches the keyframe visuals of the credits
-    /// window, so a following <see cref="DetectKeyframeVisualsAsync"/> for the same episode reads
-    /// that row instead of decoding again.
-    /// </remarks>
-    /// <param name="episode">Media file to analyze.</param>
-    /// <param name="config">The configuration the scan runs under; its black-frame threshold drives the scan and both cache rows are hashed under it.</param>
-    /// <param name="cancellationToken">Token used to cancel the FFmpeg process.</param>
-    /// <returns>A task that returns the black percentage of each keyframe.</returns>
-    internal async Task<BlackFrame[]> DetectBlackFramesAsync(QueuedEpisode episode, PluginConfiguration config, CancellationToken cancellationToken = default)
-    {
         var (start, end) = episode.GetFingerprintRange(AnalysisMode.Credits);
-        var window = new TimeRange(start, end);
-        var withVisuals = _versionGate.CheckResult.KeyframeVisualsSupported;
-
-        // The visuals row is keyed by the credits window, as the standalone visuals scan writes
-        // it; the black-frame row keeps its end-of-file key.
-        return await RunCachedScanAsync(
-            episode,
-            AnalysisMode.Credits,
-            CacheEntryType.BlackFrame,
-            start,
-            0,
-            config,
-            async () =>
-            {
-                // One decode feeds separate blackframe and visual filtergraphs: blackframe keeps
-                // source negotiation, while signalstats reads 8-bit yuv420p, which keeps the
-                // source's range.
-                var codec = await GetVideoCodecAsync(episode, cancellationToken).ConfigureAwait(false);
-                return
-                [
-                    .. KeyframeInput(codec, start, episode.Path),
-                    .. OutputArgs(KeyframeFilters(codec, $"blackframe=amount=0:threshold={config.BlackFrameThreshold}")),
-                    .. withVisuals ? OutputArgs(KeyframeFilters(codec, KeyframeVisualFilters)) : [],
-                ];
-            },
-            raw =>
-            {
-                if (withVisuals)
-                {
-                    _cacheService.Write(episode.EpisodeId, AnalysisMode.Credits, CacheEntryType.KeyframeVisual, window.Start, window.End, config, ParseKeyframeVisualsInWindow(raw, window));
-                }
-
-                return FFmpegOutputParser.ParseBlackFrames(raw);
-            },
-            cancellationToken).ConfigureAwait(false);
-    }
-
-    /// <summary>
-    /// Collects per-keyframe visual statistics (luma percentiles, saturation and frame difference)
-    /// for the credits fingerprint range.
-    /// </summary>
-    /// <remarks>
-    /// Normally served from the row the keyframe scan in
-    /// <see cref="DetectBlackFramesAsync(QueuedEpisode, PluginConfiguration, CancellationToken)"/> wrote. Decodes on
-    /// its own when that row is missing or unreadable, such as for an episode whose black-frame row
-    /// predates that shared write. Empty when the ffmpeg check found the visuals filters missing.
-    /// </remarks>
-    /// <param name="episode">Media file to analyze.</param>
-    /// <param name="config">The configuration the scan runs under; its cache row is hashed under it.</param>
-    /// <param name="cancellationToken">Token used to cancel the FFmpeg process.</param>
-    /// <returns>A task that returns per-keyframe visual statistics relative to the credits fingerprint start.</returns>
-    internal async Task<KeyframeVisual[]> DetectKeyframeVisualsAsync(QueuedEpisode episode, PluginConfiguration config, CancellationToken cancellationToken = default)
-    {
-        if (!_versionGate.CheckResult.KeyframeVisualsSupported)
+        if (!_cacheService.TryRead(episode.EpisodeId, AnalysisMode.Credits, CacheEntryType.KeyframePage, start, 0, config, out KeyframePage[] pages))
         {
-            return [];
+            LogDetectionScan(_logger, CacheEntryType.KeyframePage, start, 0, episode.Path, episode.EpisodeId);
+            pages = await ReadRawPagesAsync(episode, start, config, cancellationToken).ConfigureAwait(false);
+            _cacheService.Write(episode.EpisodeId, AnalysisMode.Credits, CacheEntryType.KeyframePage, start, 0, config, pages);
         }
 
-        // Normally a cache hit on the row the keyframe scan wrote. The decode below runs when that
-        // row is missing or unreadable, such as for an episode whose black-frame row predates that
-        // shared write. -to stops decoding near the window end; ParseKeyframeVisualsInWindow does
-        // the bounding.
-        var (start, end) = episode.GetFingerprintRange(AnalysisMode.Credits);
-        var range = new TimeRange(start, end);
-        return await RunCachedScanAsync(
-            episode,
-            AnalysisMode.Credits,
-            CacheEntryType.KeyframeVisual,
-            range.Start,
-            range.End,
-            config,
-            async () =>
-            {
-                var codec = await GetVideoCodecAsync(episode, cancellationToken).ConfigureAwait(false);
-                return
-                [
-                    .. KeyframeInput(codec, range.Start, episode.Path),
-                    "-to", range.Duration.ToString(CultureInfo.InvariantCulture),
-                    .. OutputArgs(KeyframeFilters(codec, KeyframeVisualFilters)),
-                ];
-            },
-            raw => ParseKeyframeVisualsInWindow(raw, range),
-            cancellationToken).ConfigureAwait(false);
+        // Clipped here rather than in the row, so where the window ends stays out of the key. A
+        // visual past it would let the roll end and the card run reach past CreditsFingerprintEnd
+        // and persist credits outside the scan window.
+        var duration = end - start;
+        return [.. pages.Select(page => page.Time <= duration ? page : page with { Visual = null })];
     }
 
-    // One null output with its own filtergraph. Two of these on one input decode it once.
-    private static string[] OutputArgs(string filters) => ["-an", "-dn", "-sn", "-vf", filters, "-f", "null", "-"];
+    // One ffmpeg writing every keyframe from start to the end of the file down one pipe. Frames
+    // keep their own size (-noautoscale) and all reach the pipe (passthrough), and format=yuv420p
+    // brings 10-bit sources to 8-bit values and keeps the source's range. Hardware decode returns a 10-bit
+    // 4:2:0 frame as p010, which format=yuv420p converts on another path than the yuv420p10le a
+    // software decode gives, so a source that probes as yuv420p10le goes through yuv420p10le first
+    // and keeps software's pixels. The slice retry runs in software. showinfo runs under a name
+    // drawn for this scan, which the reader looks for in each log line, so a file cannot print a
+    // line that reads as one of its headers.
+    private async Task<KeyframePage[]> ReadRawPagesAsync(QueuedEpisode episode, double start, PluginConfiguration config, CancellationToken cancellationToken)
+    {
+        var stream = await GetVideoStreamAsync(episode, cancellationToken).ConfigureAwait(false);
+        var hardwareInput = await HardwareDecodeInputAsync(episode, config, cancellationToken).ConfigureAwait(false);
+        var codec = stream?.Codec;
+        var showinfo = FilterInstance.Draw("showinfo");
+        var (pages, sliceStructureError) = await DecodeAsync(episode, hardwareInput, hardware => RunRawPagePipeAsync(Arguments(hardware))).ConfigureAwait(false);
+        if (sliceStructureError && WithoutSliceThreads(Arguments([])) is { } frameThreaded)
+        {
+            LogSliceThreadsRetried(_logger, episode.Path, episode.EpisodeId);
+            (pages, _) = (await RunRawPagePipeAsync(frameThreaded).ConfigureAwait(false)).Output;
+        }
+
+        return pages;
+
+        string[] Arguments(string[] hardware) =>
+        [
+            .. hardware,
+            .. KeyframeInput(codec, start, episode.Path),
+            "-an", "-dn", "-sn",
+            "-fps_mode", "passthrough", "-noautoscale",
+            "-vf", KeyframeFilters(codec, $"{(hardware.Length > 0 && stream?.PixelFormat == "yuv420p10le" ? "format=yuv420p10le," : string.Empty)}format=yuv420p,{showinfo.Name}=checksum=0"),
+            "-f", "rawvideo", "-",
+        ];
+
+        Task<((KeyframePage[] Pages, bool SliceStructureError) Output, int ExitCode)> RunRawPagePipeAsync(IReadOnlyList<string> arguments)
+            => _processRunner.RunStreamingAsync(
+                FFmpegPath,
+                ProcessArgs(arguments, "info"),
+                (stdout, stderr, kill) => RawPageReader.ReadAsync(stdout, stderr, kill, config.BlackFrameThreshold, showinfo),
+                ScanTimeout(),
+                cancellationToken);
+    }
 
     // The input of a keyframe-only decode of path from start, for a file whose mapped video
-    // stream (the one ffmpeg decodes, GetVideoCodecAsync) has the given codec.
+    // stream (the one ffmpeg decodes, GetVideoStreamAsync) has the given codec.
     private static string[] KeyframeInput(string? codec, double start, string path) =>
     [
         "-skip_frame", "nokey",
@@ -386,17 +335,20 @@ internal sealed partial class FFmpegService : IFFmpegService
     private static string KeyframeFilters(string? codec, string filters) => codec == "vp9" ? $"{KeyframeSelect},{filters}" : filters;
 
     /// <inheritdoc/>
-    public async Task<KeyframeVisual[]?> DecodeCutWindowAsync(QueuedEpisode episode, TimeRange window, CancellationToken cancellationToken = default)
+    public async Task<CutFrame[]?> DecodeCutWindowAsync(QueuedEpisode episode, TimeRange window, CancellationToken cancellationToken = default)
     {
-        // Every frame, at source resolution with the keyframe scan's filters, so a frame's
+        // Every frame, at source resolution and in the keyframe scan's pixel format, so a frame's
         // difference is on the scale of the page's. Seeking to the earlier keyframe starts the
         // decode on it.
+        var metadata = FilterInstance.Draw("metadata");
         string[] args =
         [
             "-ss", FormatSeconds(window.Start),
             "-t", FormatSeconds(window.Duration),
             "-i", episode.Path,
-            .. OutputArgs(KeyframeVisualFilters),
+            "-an", "-dn", "-sn",
+            "-vf", $"{KeyframeVisualFilters},{metadata.Name}=print",
+            "-f", "null", "-",
         ];
 
         ProcessCapture capture;
@@ -416,7 +368,7 @@ internal sealed partial class FFmpegService : IFFmpegService
             return null;
         }
 
-        return [.. FFmpegOutputParser.ParseKeyframeVisuals(capture.Stderr).Select(frame => frame with { Time = window.Start + frame.Time })];
+        return [.. FFmpegOutputParser.ParseKeyframeVisuals(capture.Stderr, metadata).Select(frame => frame with { Time = window.Start + frame.Time })];
     }
 
     // Fixed-point seconds: ffmpeg's time parser rejects the exponent the default format gives a
@@ -429,16 +381,8 @@ internal sealed partial class FFmpegService : IFFmpegService
     [LoggerMessage(Level = LogLevel.Debug, Message = "Cut window of {Episode} unusable: ffmpeg exited with code {ExitCode}, output truncated at the byte cap: {Truncated}")]
     private partial void LogCutWindowUnusable(string episode, int exitCode, bool truncated);
 
-    // -to does not reliably bound a -skip_frame nokey scan (FFmpeg still emits keyframes past the
-    // requested duration) and the keyframe scan runs to end of file, so every writer of a
-    // KeyframeVisual row clips here. Times are relative to the -ss seek, so an in-window frame
-    // falls within [0, window.Duration]; an unclipped run would let FindCreditRange select a
-    // card run past CreditsFingerprintEnd and persist credits outside the scan window.
-    private static KeyframeVisual[] ParseKeyframeVisualsInWindow(string raw, TimeRange window)
-        => [.. FFmpegOutputParser.ParseKeyframeVisuals(raw).Where(v => v.Time >= 0 && v.Time <= window.Duration)];
-
     /// <inheritdoc/>
-    public Task<BlackInterval[]> DetectBlackIntervalsAsync(QueuedEpisode episode, TimeRange range, int minimum, PluginConfiguration config, CancellationToken cancellationToken = default)
+    public async Task<BlackInterval[]> DetectBlackIntervalsAsync(QueuedEpisode episode, TimeRange range, int minimum, PluginConfiguration config, CancellationToken cancellationToken = default)
     {
         var pixelThreshold = FormatBlackDetectPixelThreshold(config.BlackFrameThreshold);
         var pictureRatioThreshold = FormatBlackDetectPictureRatioThreshold(minimum);
@@ -456,7 +400,7 @@ internal sealed partial class FFmpegService : IFFmpegService
 
         // blackdetect prints times relative to the seek. The row holds absolute media times, the
         // time base of its key, so where the credits window starts never shifts them.
-        return RunCachedScanAsync(
+        var intervals = await RunCachedScanAsync(
             episode,
             AnalysisMode.Credits,
             CacheEntryType.BlackInterval,
@@ -464,8 +408,17 @@ internal sealed partial class FFmpegService : IFFmpegService
             range.End,
             config,
             args,
+            hardwareDecodable: true,
             raw => FFmpegOutputParser.ParseBlackIntervals(raw).Select(interval => new BlackInterval(interval.Start + range.Start, interval.End + range.Start)).ToArray(),
-            cancellationToken);
+            cancellationToken).ConfigureAwait(false);
+
+        // jellyfin-ffmpeg 7.1.3 logs blackdetect under its class name, so no instance name keeps a
+        // file's tags from printing an interval. Clipping to the probed range bounds what such a
+        // line can claim, but a forged interval inside the range still stands. The clip runs at the
+        // read, so it covers rows cached before it too.
+        return [.. intervals
+            .Select(interval => new BlackInterval(Math.Max(interval.Start, range.Start), Math.Min(interval.End, range.End)))
+            .Where(interval => interval.End > interval.Start)];
     }
 
     // blackdetect's pix_th is a fraction of the luma range; internally it derives the absolute cutoff
@@ -493,6 +446,7 @@ internal sealed partial class FFmpegService : IFFmpegService
     public async Task<double[]> DetectKeyFramesAsync(QueuedEpisode episode, TimeRange range, AnalysisMode mode, PluginConfiguration config, CancellationToken cancellationToken = default)
     {
         // -to runs after showinfo, so the parser clips keyframes logged past the requested window.
+        var showinfo = FilterInstance.Draw("showinfo");
         var keyframes = await RunCachedScanAsync(
             episode,
             mode,
@@ -502,17 +456,18 @@ internal sealed partial class FFmpegService : IFFmpegService
             config,
             async () =>
             {
-                var codec = await GetVideoCodecAsync(episode, cancellationToken).ConfigureAwait(false);
+                var codec = (await GetVideoStreamAsync(episode, cancellationToken).ConfigureAwait(false))?.Codec;
                 return
                 [
                     .. KeyframeInput(codec, range.Start, episode.Path),
                     "-to", range.Duration.ToString(CultureInfo.InvariantCulture),
                     "-an", "-dn", "-sn",
-                    "-vf", KeyframeFilters(codec, "showinfo"),
+                    "-vf", KeyframeFilters(codec, showinfo.Name),
                     "-f", "null", "-",
                 ];
             },
-            raw => FFmpegOutputParser.ParseKeyFrames(raw, range.Start, _logger),
+            hardwareDecodable: false,
+            raw => FFmpegOutputParser.ParseKeyFrames(raw, showinfo, range.Start, _logger),
             cancellationToken).ConfigureAwait(false);
         return [.. keyframes.Where(time => time >= range.Start && time <= range.End)];
     }
@@ -526,9 +481,10 @@ internal sealed partial class FFmpegService : IFFmpegService
         double end,
         PluginConfiguration config,
         IReadOnlyList<string> args,
+        bool hardwareDecodable,
         Func<string, T[]> parse,
         CancellationToken cancellationToken)
-        => RunCachedScanAsync(episode, mode, entryType, start, end, config, () => Task.FromResult(args), parse, cancellationToken);
+        => RunCachedScanAsync(episode, mode, entryType, start, end, config, () => Task.FromResult(args), hardwareDecodable, parse, cancellationToken);
 
     /// <summary>
     /// Serves a detection scan from the cache or runs ffmpeg, parses its stderr and caches the result.
@@ -541,7 +497,8 @@ internal sealed partial class FFmpegService : IFFmpegService
     /// <param name="end">Cache key end; must be the exact value used when the row was written.</param>
     /// <param name="config">The configuration the arguments were built from; the row is read and written under its hash.</param>
     /// <param name="args">Builds the ffmpeg arguments. Runs only on a cache miss, so it may probe the file first.</param>
-    /// <param name="parse">Parses ffmpeg's stderr into the scan result. Runs only on a cache miss, so it may also record other results of the same run.</param>
+    /// <param name="hardwareDecodable">Whether the scan decodes on hardware under <see cref="PluginConfiguration.UseHardwareDecoding"/>, which then probes the file for its video stream when Jellyfin's gates let a method through.</param>
+    /// <param name="parse">Parses ffmpeg's stderr into the scan result. Runs only on a cache miss.</param>
     /// <param name="cancellationToken">Cancels the scan.</param>
     /// <returns>The cached or freshly parsed result.</returns>
     private async Task<T[]> RunCachedScanAsync<T>(
@@ -552,6 +509,7 @@ internal sealed partial class FFmpegService : IFFmpegService
         double end,
         PluginConfiguration config,
         Func<Task<IReadOnlyList<string>>> args,
+        bool hardwareDecodable,
         Func<string, T[]> parse,
         CancellationToken cancellationToken)
     {
@@ -565,12 +523,13 @@ internal sealed partial class FFmpegService : IFFmpegService
         LogDetectionScan(_logger, entryType, start, end, episode.Path, episode.EpisodeId);
 
         var arguments = await args().ConfigureAwait(false);
-        var raw = await RunScanAsync(arguments).ConfigureAwait(false);
+        string[] hardware = hardwareDecodable ? await HardwareDecodeInputAsync(episode, config, cancellationToken).ConfigureAwait(false) : [];
+        var raw = await DecodeAsync(episode, hardware, input => RunScanAsync([.. input, .. arguments])).ConfigureAwait(false);
         if (WithoutSliceThreads(arguments) is { } frameThreaded
             && SliceStructureErrors.Any(error => raw.Contains(error, StringComparison.Ordinal)))
         {
             LogSliceThreadsRetried(_logger, episode.Path, episode.EpisodeId);
-            raw = await RunScanAsync(frameThreaded).ConfigureAwait(false);
+            (raw, _) = await RunScanAsync(frameThreaded).ConfigureAwait(false);
         }
 
         var result = parse(raw);
@@ -579,9 +538,174 @@ internal sealed partial class FFmpegService : IFFmpegService
 
         return result;
 
-        async Task<string> RunScanAsync(IReadOnlyList<string> scanArguments)
-            => Encoding.UTF8.GetString(await GetOutputAsync(scanArguments, stderr: true, infoQuery: false, timeout: ScanTimeout(), cancellationToken).ConfigureAwait(false));
+        async Task<(string Output, int ExitCode)> RunScanAsync(IReadOnlyList<string> scanArguments)
+        {
+            var capture = await _processRunner.RunCapturedAsync(FFmpegPath, ProcessArgs(scanArguments, "info"), long.MaxValue, expectedStdoutBytes: 0, ScanTimeout(), cancellationToken).ConfigureAwait(false);
+            return (capture.Stderr, capture.ExitCode);
+        }
     }
+
+    /// <summary>
+    /// Runs a scan under hardware decode when <paramref name="hardware"/> holds input options, and
+    /// in software when it holds none or the hardware run exits nonzero, times out or breaks the
+    /// raw page protocol. Nothing the failed run wrote is kept. A software run's result stands
+    /// whatever its exit code.
+    /// </summary>
+    /// <typeparam name="T">What the scan reads from ffmpeg.</typeparam>
+    /// <param name="episode">The episode scanned, named in the log.</param>
+    /// <param name="hardware">The input options from <see cref="HardwareDecodeInputAsync"/>.</param>
+    /// <param name="run">Runs ffmpeg with the given input options in front of the scan's own arguments.</param>
+    /// <returns>The accepted run's output.</returns>
+    private async Task<T> DecodeAsync<T>(QueuedEpisode episode, string[] hardware, Func<string[], Task<(T Output, int ExitCode)>> run)
+    {
+        if (hardware.Length > 0)
+        {
+            try
+            {
+                var (output, exitCode) = await run(hardware).ConfigureAwait(false);
+                if (exitCode == 0)
+                {
+                    return output;
+                }
+
+                LogHardwareDecodeFailed(_logger, episode.Path, episode.EpisodeId, exitCode);
+            }
+            catch (Exception ex) when (ex is InvalidDataException || IsProcessFailure(ex))
+            {
+                // A hung device, a broken pipe or a process that died partway through a frame is the hardware
+                // run's failure, so software gets a full timeout of its own.
+                LogHardwareDecodeBroke(_logger, episode.Path, episode.EpisodeId, ex.Message);
+            }
+        }
+
+        return (await run([]).ConfigureAwait(false)).Output;
+    }
+
+    // The hardware decode input options of a scan under config and the server's current encoding
+    // options, or none. Probes the file only when Jellyfin's gates let a method through.
+    private async Task<string[]> HardwareDecodeInputAsync(QueuedEpisode episode, PluginConfiguration config, CancellationToken cancellationToken)
+    {
+        if (!config.UseHardwareDecoding
+            || _encodingOptions() is not { } encoding
+            || HardwareDecodeMethod(encoding) is not { Length: > 0 } method
+            || !JellyfinAllowsHardwareDecode(method))
+        {
+            return [];
+        }
+
+        FFmpegOutputParser.VideoStream? stream;
+        try
+        {
+            stream = await GetVideoStreamAsync(episode, cancellationToken).ConfigureAwait(false);
+        }
+        catch (Exception ex) when (ex is InvalidDataException || IsProcessFailure(ex))
+        {
+            // The recap and interval scans ask for the stream only to choose hardware. A failed
+            // probe puts them back on the software path they ran before hardware decode, which
+            // reports a real problem with the file itself. The keyframe scan probed first, so a
+            // probe failure there has already thrown.
+            LogHardwareDecodeProbeFailed(ex, episode.Path);
+            return [];
+        }
+
+        return DecodesOnHardware(encoding, stream) ? [.. method, "-xerror"] : [];
+    }
+
+    // Jellyfin's two gates, read when a scan starts. A transcode starting later shares the
+    // decoder with that scan until the scan ends: Jellyfin has no decoder slot count to wait on.
+    // An audio-only transcode also reports IsVideoDirect false, but with no VideoCodec. NowPlayingItem
+    // is left out because a transcode can run before its client reports playing. The cost is that
+    // a TranscodingInfo Jellyfin leaves set after a stop report with no PlaySessionId keeps scans in
+    // software until the device's next report.
+    private bool JellyfinAllowsHardwareDecode(string[] method)
+        => (_mediaEncoder?.SupportsHwaccel(method[Array.IndexOf(method, "-hwaccel") + 1]) ?? true)
+            && !(_sessionManager?.Sessions.Any(session => session.TranscodingInfo is { IsVideoDirect: false, VideoCodec: not null }) ?? false);
+
+    /// <summary>
+    /// The hwaccel input options Jellyfin's playback decodes with under its acceleration type, or
+    /// none when the scans decode in software.
+    /// </summary>
+    /// <remarks>
+    /// VAAPI decodes on Jellyfin's VAAPI device and only on Linux, NVENC through CUDA, AMF through
+    /// D3D11VA on the first AMD adapter and only on Windows, QSV through VAAPI on Linux
+    /// (<see cref="LinuxQsvMethod"/>) and through D3D11VA on Windows (<see cref="WindowsQsvDevice"/>),
+    /// both only while <see cref="EncodingOptions.PreferSystemNativeHwDecoder"/> is on, and VideoToolbox
+    /// only on macOS, as Jellyfin does. RKMPP and V4L2 decode in software. No output format is set,
+    /// so each frame comes back to system memory.
+    /// </remarks>
+    /// <param name="encoding">Jellyfin's encoding options.</param>
+    /// <returns>The options to place before <c>-i</c>, or none.</returns>
+    internal static string[] HardwareDecodeMethod(EncodingOptions encoding) => encoding.HardwareAccelerationType switch
+    {
+        HardwareAccelerationType.vaapi when OperatingSystem.IsLinux() && !string.IsNullOrEmpty(encoding.VaapiDevice) => ["-hwaccel", "vaapi", "-hwaccel_device", encoding.VaapiDevice],
+        HardwareAccelerationType.vaapi when OperatingSystem.IsLinux() => ["-hwaccel", "vaapi"],
+        HardwareAccelerationType.nvenc => ["-hwaccel", "cuda"],
+        HardwareAccelerationType.amf when OperatingSystem.IsWindows() => ["-init_hw_device", "d3d11va=dx11:,vendor=0x1002", "-hwaccel", "d3d11va"],
+        HardwareAccelerationType.qsv when OperatingSystem.IsLinux() => LinuxQsvMethod(encoding),
+        HardwareAccelerationType.qsv when OperatingSystem.IsWindows() && encoding.PreferSystemNativeHwDecoder => ["-init_hw_device", WindowsQsvDevice(encoding.QsvDevice), "-hwaccel", "d3d11va"],
+        HardwareAccelerationType.videotoolbox when OperatingSystem.IsMacOS() => ["-hwaccel", "videotoolbox"],
+        _ => [],
+    };
+
+    /// <summary>
+    /// The hwaccel options of QSV on Linux, which decode the way Jellyfin's default native path
+    /// does: through VAAPI on the device Jellyfin derives its QSV device from, or none when
+    /// <see cref="EncodingOptions.PreferSystemNativeHwDecoder"/> is off.
+    /// </summary>
+    /// <remarks>
+    /// Jellyfin names the device by render node when <see cref="EncodingOptions.QsvDevice"/> is an
+    /// existing file and by vendor otherwise, and takes the vendor form only from ffmpeg 7.0.1 on.
+    /// The plugin requires ffmpeg 7.1.3, and on an older one device setup fails and the scan reruns
+    /// in software.
+    /// </remarks>
+    /// <param name="encoding">Jellyfin's encoding options.</param>
+    /// <returns>The options to place before <c>-i</c>, or none.</returns>
+    internal static string[] LinuxQsvMethod(EncodingOptions encoding) => encoding.PreferSystemNativeHwDecoder
+        ? ["-init_hw_device", (File.Exists(encoding.QsvDevice) ? $"vaapi=va:{encoding.QsvDevice}" : "vaapi=va:,vendor_id=0x8086") + ",driver=iHD", "-hwaccel", "vaapi"]
+        : [];
+
+    /// <summary>
+    /// The D3D11VA device QSV on Windows decodes on, the one Jellyfin derives its QSV device from:
+    /// the adapter at the index <see cref="EncodingOptions.QsvDevice"/> holds, a negative one read as 0,
+    /// and otherwise the first Intel adapter.
+    /// </summary>
+    /// <param name="qsvDevice">Jellyfin's QSV device setting.</param>
+    /// <returns>The <c>-init_hw_device</c> value.</returns>
+    private static string WindowsQsvDevice(string qsvDevice)
+        => int.TryParse(qsvDevice, NumberStyles.Integer, CultureInfo.InvariantCulture, out var index)
+            ? string.Create(CultureInfo.InvariantCulture, $"d3d11va=dx11:{Math.Max(index, 0)}")
+            : "d3d11va=dx11:,vendor=0x8086";
+
+    /// <summary>
+    /// Whether a scan decodes the stream on hardware, given a method: only the formats measured under VAAPI and D3D11VA to
+    /// give software's frames, which Jellyfin's playback also decodes on hardware.
+    /// </summary>
+    /// <remarks>
+    /// H.264 and HEVC at <c>yuv420p</c> or <c>yuvj420p</c> qualify, and 10-bit 4:2:0 HEVC while
+    /// Jellyfin decodes 10-bit HEVC on hardware, each only while Jellyfin decodes the codec on
+    /// hardware. HEVC RExt, H.264 High 4:2:2 and High 4:4:4 (Jellyfin refuses these by profile by default,
+    /// since they can be encoded at 4:2:0), Hi10P H.264 and AV1 stay in software: VAAPI applies
+    /// AV1 film grain differently from software, and the others were not measured. QSV on Windows and
+    /// VideoToolbox decode the same formats without having been compared with software. Under
+    /// VideoToolbox, Jellyfin's playback decodes more on hardware than the scans do: HEVC RExt, 10-bit
+    /// HEVC with its setting off, and on Apple Silicon H.264 High 4:2:2 and High 4:4:4.
+    /// </remarks>
+    /// <param name="encoding">Jellyfin's encoding options.</param>
+    /// <param name="stream">The video stream the scan decodes, or <see langword="null"/> when there is none.</param>
+    /// <returns><see langword="true"/> when the stream decodes on hardware.</returns>
+    internal static bool DecodesOnHardware(EncodingOptions encoding, FFmpegOutputParser.VideoStream? stream)
+        => stream is { Codec: "h264" or "hevc" }
+            && encoding.HardwareDecodingCodecs.Contains(stream.Codec, StringComparer.OrdinalIgnoreCase)
+            && !(stream.Profile is { } profile
+                && (stream.Codec == "h264"
+                    ? profile.Contains("4:2:2", StringComparison.Ordinal) || profile.Contains("4:4:4", StringComparison.Ordinal)
+                    : profile.Contains("Rext", StringComparison.Ordinal)))
+            && stream.PixelFormat switch
+            {
+                "yuv420p" or "yuvj420p" => true,
+                "yuv420p10le" => stream.Codec == "hevc" && encoding.EnableDecodingColorDepth10Hevc,
+                _ => false,
+            };
 
     // The arguments with HevcKeyframeThreads taken out, or null when they don't hold it.
     private static string[]? WithoutSliceThreads(IReadOnlyList<string> arguments)
@@ -614,7 +738,7 @@ internal sealed partial class FFmpegService : IFFmpegService
                 filePath,
             ];
 
-            var output = Encoding.UTF8.GetString(await _processRunner.RunAsync(ffprobePath, args, stderr: false, timeout: 10 * 1000, cancellationToken: cancellationToken).ConfigureAwait(false)).Trim();
+            var output = Encoding.UTF8.GetString(await _processRunner.RunAsync(ffprobePath, args, timeout: 10 * 1000, cancellationToken: cancellationToken).ConfigureAwait(false)).Trim();
             if (string.IsNullOrWhiteSpace(output))
             {
                 return null;
@@ -1029,36 +1153,32 @@ internal sealed partial class FFmpegService : IFFmpegService
     private partial void LogSubtitleScanFailed(Exception ex, string file);
 
     /// <summary>
-    /// Runs ffmpeg and returns standard output (or error).
+    /// Runs ffmpeg and returns standard output.
     /// </summary>
     /// <param name="args">Arguments to pass to ffmpeg as individual tokens.</param>
-    /// <param name="stderr"><see langword="true"/> to return standard error, where the detection
-    /// filters print their results at info log level; otherwise, <see langword="false"/> for
-    /// standard output at warning level.</param>
     /// <param name="infoQuery"><see langword="true"/> for a version or help query, which takes no
     /// input and rejects a trailing <c>-threads</c> option; otherwise, <see langword="false"/>.</param>
     /// <param name="timeout">Timeout (in milliseconds) to wait for ffmpeg to exit.</param>
     /// <param name="cancellationToken">Token used to cancel the FFmpeg process.</param>
     private Task<byte[]> GetOutputAsync(
         IReadOnlyList<string> args,
-        bool stderr,
         bool infoQuery,
         int timeout,
         CancellationToken cancellationToken)
-        => _processRunner.RunAsync(FFmpegPath, ProcessArgs(args, stderr ? "info" : "warning", infoQuery), stderr, timeout, cancellationToken);
+        => _processRunner.RunAsync(FFmpegPath, ProcessArgs(args, "warning", infoQuery), timeout, cancellationToken);
 
     // Called only on a scan cache miss, so an episode whose scans are all cached is never probed.
-    private Task<string?> GetVideoCodecAsync(QueuedEpisode episode, CancellationToken cancellationToken)
-        => _videoCodecs.GetAsync(episode, episode.Path, ct => ProbeVideoCodecAsync(episode.Path, ct), cancellationToken);
+    private Task<FFmpegOutputParser.VideoStream?> GetVideoStreamAsync(QueuedEpisode episode, CancellationToken cancellationToken)
+        => _videoStreams.GetAsync(episode, episode.Path, ct => ProbeVideoStreamAsync(episode.Path, ct), cancellationToken);
 
-    // The codec name of the video stream a scan decodes, such as "hevc", read from the stream
+    // The video stream a scan decodes, its codec such as "hevc" and pixel format, read from the stream
     // mapping of an ffmpeg run that decodes no frame. ffmpeg ranks the video streams by frame
     // size, the default disposition and whether the stream delivered packets while ffmpeg
     // probed the file. ffprobe cannot report the last, so no ffprobe rule can copy the choice.
     // Null when the file has no video stream. A run that fails to start, times out or is cut at
     // the cap before its stream mapping throws instead, since the scan would cache a VP9 file's
     // every frame as a keyframe.
-    private async Task<string?> ProbeVideoCodecAsync(string filePath, CancellationToken cancellationToken)
+    private async Task<FFmpegOutputParser.VideoStream?> ProbeVideoStreamAsync(string filePath, CancellationToken cancellationToken)
     {
         string[] args = ["-i", filePath, "-an", "-dn", "-sn", "-frames:v", "0", "-f", "null", "-"];
 
@@ -1071,13 +1191,13 @@ internal sealed partial class FFmpegService : IFFmpegService
             expectedStdoutBytes: 0,
             ScanTimeout(),
             cancellationToken).ConfigureAwait(false);
-        var codec = FFmpegOutputParser.ParseMappedVideoCodec(capture.Stderr);
-        if (codec is null && capture.Truncated)
+        var stream = FFmpegOutputParser.ParseMappedVideoStream(capture.Stderr);
+        if (stream is null && capture.Truncated)
         {
             throw new InvalidDataException($"The ffmpeg log of \"{filePath}\" passed {VideoCodecProbeMaximumBytes} bytes before its stream mapping");
         }
 
-        return codec;
+        return stream;
     }
 
     /// <summary>
@@ -1175,7 +1295,6 @@ internal sealed partial class FFmpegService : IFFmpegService
             var output = Encoding.UTF8.GetString(await _processRunner.RunAsync(
                 GetFFprobePath(),
                 args,
-                stderr: false,
                 timeout: 10 * 1000,
                 cancellationToken: cancellationToken).ConfigureAwait(false));
 
@@ -1310,7 +1429,7 @@ internal sealed partial class FFmpegService : IFFmpegService
         byte[] rawPoints;
         try
         {
-            rawPoints = await GetOutputAsync(args, stderr: false, infoQuery: false, timeout: ScanTimeout(), cancellationToken).ConfigureAwait(false);
+            rawPoints = await GetOutputAsync(args, infoQuery: false, timeout: ScanTimeout(), cancellationToken).ConfigureAwait(false);
         }
         catch (TimeoutException ex)
         {
@@ -1358,8 +1477,14 @@ internal sealed partial class FFmpegService : IFFmpegService
     [LoggerMessage(Level = LogLevel.Information, Message = "HEVC slice errors in \"{File}\" (id {Id}), decoding again with frame threads")]
     private static partial void LogSliceThreadsRetried(ILogger logger, string file, Guid id);
 
-    [LoggerMessage(Level = LogLevel.Warning, Message = "The installed version of ffmpeg does not support the {Filter} filter; credits on a uniform card will not be detected, and credits will not start on a cut")]
-    private static partial void LogKeyframeVisualFilterUnsupported(ILogger logger, string filter);
+    [LoggerMessage(Level = LogLevel.Information, Message = "Hardware decode of \"{File}\" (id {Id}) exited with code {ExitCode}, decoding again in software")]
+    private static partial void LogHardwareDecodeFailed(ILogger logger, string file, Guid id, int exitCode);
+
+    [LoggerMessage(Level = LogLevel.Information, Message = "Hardware decode of \"{File}\" (id {Id}) failed ({Reason}), decoding again in software")]
+    private static partial void LogHardwareDecodeBroke(ILogger logger, string file, Guid id, string reason);
+
+    [LoggerMessage(Level = LogLevel.Information, Message = "Could not probe \"{File}\" for hardware decode, scanning in software")]
+    private partial void LogHardwareDecodeProbeFailed(Exception ex, string file);
 
     [LoggerMessage(Level = LogLevel.Warning, Message = "Chromaprint returned {Count} points for \"{Path}\"")]
     private static partial void LogChromaprintReturnedPoints(ILogger logger, int count, string path);

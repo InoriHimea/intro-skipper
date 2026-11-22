@@ -339,12 +339,6 @@ export const configSchema = {
         description:
             "For each season, choose whether the first episode intro is analyzed, ignored, or ignored only when the show is anime.",
     },
-    AnimePreviewFromCreditsEnd: {
-        kind: "checkbox",
-        label: "Set post-credits scene as preview for anime",
-        description:
-            "When enabled and no preview was detected, create a segment from the end of the last credits block to the end of the episode. This can also be toggled for any season or show in Timestamps > Manage.",
-    },
     IntroStartOffset: {
         kind: "number",
         label: "Intro Start Offset (seconds)",
@@ -355,7 +349,7 @@ export const configSchema = {
     },
     IncludeIntroStartOffsetWhenSnapping: {
         kind: "checkbox",
-        label: "Include start offset when snapping to episode start",
+        label: "Include intro offset when snapping to episode start",
         description:
             "When enabled, Intro Start Offset is also applied when the detected intro start is snapped to the beginning of the episode.",
     },
@@ -366,6 +360,28 @@ export const configSchema = {
         step: 0.5,
         description:
             "Default: 0. Example: If set to 3, playback will resume 3 seconds before the end of the intro.",
+    },
+    CreditsStartOffset: {
+        kind: "number",
+        label: "Credits Start Offset (seconds)",
+        min: 0,
+        step: 1,
+        description:
+            "Default: 0. Example: If set to 3, the first 3 seconds of the credits will play before skipping.",
+    },
+    CreditsEndOffset: {
+        kind: "number",
+        label: "Credits End Offset (seconds)",
+        min: 0,
+        step: 1,
+        description:
+            "Default: 0. Example: If set to 3, playback will resume 3 seconds before the end of the credits.",
+    },
+    IncludeCreditsEndOffsetWhenSnapping: {
+        kind: "checkbox",
+        label: "Include credits offset when snapping to episode end",
+        description:
+            "When enabled, Credits End Offset is also applied when the detected credits end is snapped to the end of the episode.",
     },
 
     // Black frame
@@ -540,6 +556,12 @@ export const configSchema = {
         max: 16,
         description:
             "Codec threads per FFmpeg process. 0 lets FFmpeg choose. Lower values reduce CPU use but may slow scans; use Maximum degree of parallelism to limit process count.",
+    },
+    UseHardwareDecoding: {
+        kind: "checkbox",
+        label: "Hardware decode",
+        description:
+            "Follows Jellyfin's hardware settings for the keyframe, recap and black interval scans, in software while a video transcode runs. Can be slower on weak integrated GPUs and 10-bit HEVC, so measure before leaving it on.",
     },
     ScanTimeoutSeconds: {
         kind: "number",

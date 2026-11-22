@@ -46,12 +46,12 @@ public class TestBlackFrames
     }
 
     /// <summary>
-    /// A 10-bit gray source at luma 80 (20 on the 8-bit scale) is black at threshold 28 when read
-    /// as gray, but not after conversion to limited-range yuv420p (luma 33). FFmpeg emits two or
-    /// three frames for this synthetic clip.
+    /// A named class: the scan's pipe is yuv420p, and a 10-bit gray source at luma 80 (20 on the
+    /// 8-bit scale) converts to limited-range luma 33, over threshold 28, where the blackframe filter
+    /// read it as gray and called it black. FFmpeg emits two or three frames for this synthetic clip.
     /// </summary>
     [FactSkipFFmpegTests]
-    public async Task DetectBlackFramesAsync_KeepsBlackFrameFormatNegotiationOnGraySources()
+    public async Task ScanKeyframesAsync_ReadsGraySourcesAfterTheirConversionToYuv420p()
     {
         var path = DatabaseTestHelpers.CreateTempDbPath(Guid.NewGuid().ToString("N") + "-gray10.mkv");
         await new FFmpegProcessRunner(NullLogger.Instance).RunAsync(
@@ -62,10 +62,10 @@ public class TestBlackFrames
             var episode = new QueuedEpisode { EpisodeId = Guid.NewGuid(), Name = "gray10", Path = path, Duration = 3 };
             var ffmpegService = FfmpegTestHelpers.CreateFFmpegService();
 
-            var frames = await ffmpegService.DetectBlackFramesAsync(episode, new PluginConfiguration());
+            var pages = await ffmpegService.ScanKeyframesAsync(episode, new PluginConfiguration());
 
-            Assert.InRange(frames.Length, 2, 3);
-            Assert.All(frames, frame => Assert.Equal(100, frame.Percentage));
+            Assert.InRange(pages.Length, 2, 3);
+            Assert.All(pages, page => Assert.Equal(0, page.BlackPercentage));
         }
         finally
         {
@@ -127,7 +127,7 @@ public class TestBlackFrames
     [Theory]
     [InlineData("\n")]
     [InlineData("\r\n")]
-    public void ParseMappedVideoCodec_ReadsTheMappingBlockNotATagThatRepeatsIt(string newLine)
+    public void ParseMappedVideoStream_ReadsTheMappingBlockNotATagThatRepeatsIt(string newLine)
     {
         var stderr = """
             Input #0, matroska,webm, from 'episode.mkv':
@@ -147,11 +147,11 @@ public class TestBlackFrames
                                 :   Stream #0:1 -> #0:0 (vp9 (native) -> wrapped_avframe (native))
             """.ReplaceLineEndings(newLine);
 
-        Assert.Equal("h264", FFmpegOutputParser.ParseMappedVideoCodec(stderr));
+        Assert.Equal(new("h264", "yuv420p", "(High)"), FFmpegOutputParser.ParseMappedVideoStream(stderr));
     }
 
     [Fact]
-    public void ParseMappedVideoCodec_ReturnsNullWithoutAMappingBlock()
+    public void ParseMappedVideoStream_ReturnsNullWithoutAMappingBlock()
     {
         // A file without a video stream: ffmpeg maps nothing and prints no block.
         const string Stderr = """
@@ -162,7 +162,25 @@ public class TestBlackFrames
             Error opening output file -.
             """;
 
-        Assert.Null(FFmpegOutputParser.ParseMappedVideoCodec(Stderr));
+        Assert.Null(FFmpegOutputParser.ParseMappedVideoStream(Stderr));
+    }
+
+    /// <summary>
+    /// The pixel format comes from the stream the mapping names, not the first video stream of
+    /// the input dump, which here is 8-bit cover art in front of a 10-bit episode.
+    /// </summary>
+    [Fact]
+    public void ParseMappedVideoStream_ReadsThePixelFormatOfTheMappedStream()
+    {
+        const string Stderr = """
+            Input #0, matroska,webm, from 'episode.mkv':
+              Stream #0:0: Video: mjpeg (Baseline), yuvj420p(pc, bt470bg/unknown/unknown), 600x600, 90k tbr, 90k tbn (attached pic)
+              Stream #0:1(eng): Video: hevc (Main 10) (hvc1 / 0x31637668), yuv420p10le(tv, bt2020nc/bt2020/smpte2084), 3840x2160 [SAR 1:1 DAR 16:9], 23.98 fps, 23.98 tbr, 1k tbn (default)
+            Stream mapping:
+              Stream #0:1 -> #0:0 (hevc (native) -> wrapped_avframe (native))
+            """;
+
+        Assert.Equal(new("hevc", "yuv420p10le", "(Main 10) (hvc1 / 0x31637668)"), FFmpegOutputParser.ParseMappedVideoStream(Stderr));
     }
 
     [FactSkipFFmpegTests]
@@ -177,29 +195,6 @@ public class TestBlackFrames
             new PluginConfiguration());
 
         Assert.Equal([100], actual);
-    }
-
-    [FactSkipFFmpegTests]
-    public async Task TestDetectKeyframeVisuals_ClipsScanToCreditsWindow()
-    {
-        // Real FFmpeg: -skip_frame nokey + -to does NOT reliably bound the scan (it emits keyframes
-        // past the requested duration), so DetectKeyframeVisualsAsync must clip parsed visuals to the
-        // window. credits.mp4 has keyframes every 10s; for window [5,35] (Start=5, Duration=30) the scan
-        // must return only the in-window keyframes (seek-relative 5/15/25 = source 10/20/30), never the
-        // leaked frames past 30s that would otherwise let credits be detected past CreditsFingerprintEnd.
-        var episode = FfmpegTestHelpers.QueueFile("video/credits.mp4");
-        episode.Duration = 330;
-        episode.CreditsFingerprintStart = 5;
-        episode.CreditsFingerprintEnd = 35;
-
-        var visuals = await FfmpegTestHelpers.CreateFFmpegService().DetectKeyframeVisualsAsync(episode, new PluginConfiguration());
-
-        Assert.NotEmpty(visuals);
-        Assert.All(visuals, v => Assert.InRange(v.Time, 0, 30)); // clipped to range.Duration, no leak
-        Assert.Equal(new[] { 5.0, 15.0, 25.0 }, Array.ConvertAll(visuals, v => v.Time));
-        Assert.All(visuals, v => Assert.True(v.LumaLow <= v.LumaHigh)); // real percentiles parsed
-        Assert.All(visuals, v => Assert.All([v.LumaMin, v.LumaLow, v.LumaHigh, v.LumaMax], luma => Assert.InRange(luma, 0, 255)));
-        Assert.All(visuals, v => Assert.True(v.Saturation >= 0)); // real SATAVG parsed
     }
 
     [Fact]
@@ -472,12 +467,12 @@ public class TestBlackFrames
         {
             "black" => Roll((20, 54, 95, KeyframeVisuals.Black)),
             "tinted" => Roll((20, 54, 95, KeyframeVisuals.Tinted)),
-            "saturated background" => Roll((20, 54, 95, t => new KeyframeVisual(t, 16, 16, 16, 235, 30, 0))),
+            "saturated background" => Roll((20, 54, 95, new KeyframeVisual(16, 16, 16, 235, 30, 0))),
             "blank" => Roll((20, 54, 95, KeyframeVisuals.BlankBlack)),
             "one page" => Roll((30, 30, 95, KeyframeVisuals.Black), (20, 54, 95, KeyframeVisuals.BlankBlack)),
-            "most pages" => Roll((20, 54, 95, t => (t - 20) % 1.5 == 0 ? KeyframeVisuals.BlankBlack(t) : KeyframeVisuals.Black(t))),
-            "half the pages" => Roll((20, 54, 95, t => (t - 20) % 1 == 0 ? KeyframeVisuals.BlankBlack(t) : KeyframeVisuals.Black(t))),
-            "none" => Roll((20, 54, 95, _ => null)),
+            "most pages" => [.. Times(20, 54, 0.5).Select(t => new Keyframe(t, 95, (t - 20) % 1.5 == 0 ? KeyframeVisuals.BlankBlack : KeyframeVisuals.Black))],
+            "half the pages" => [.. Times(20, 54, 0.5).Select(t => new Keyframe(t, 95, (t - 20) % 1 == 0 ? KeyframeVisuals.BlankBlack : KeyframeVisuals.Black))],
+            "none" => Roll((20, 54, 95, null)),
             "dense text" => Roll((20, 54, 89, KeyframeVisuals.DenseText)),
             "red text" => Roll((20, 54, 95, KeyframeVisuals.RedText)),
             "dense red text" => Roll((20, 54, 89, KeyframeVisuals.DenseRedText)),
@@ -490,12 +485,12 @@ public class TestBlackFrames
             "letterboxed dark majority" => Roll((20, 37.5, 89, KeyframeVisuals.LetterboxedDark), (38, 54, 95, KeyframeVisuals.Black)),
             "big text" => Roll((20, 54, 89, KeyframeVisuals.BigText)),
             "dense first pages" => Roll((20, 23.5, 89, KeyframeVisuals.DenseText), (24, 54, 95, KeyframeVisuals.Black)),
-            "dark picture after a black head" => Roll((20, 20, 95, t => new KeyframeVisual(t, 15, 17, 19, 179, 1.1, 0)), (20.5, 54, 95, t => new KeyframeVisual(t, 15, 17, 26, 100, 2, 0))),
-            "dense white text on a tint" => Roll((20, 20, 95, KeyframeVisuals.Black), (20.5, 54, 95, t => new KeyframeVisual(t, 10, 16, 37, 241, 1.2, 0))),
-            "dense warm grey text" => Roll((20, 20, 95, KeyframeVisuals.Black), (20.5, 54, 95, t => new KeyframeVisual(t, 16, 16, 30, 150, 0.9, 0))),
-            "dense coloured text" => Roll((20, 20, 95, KeyframeVisuals.Black), (20.5, 54, 95, t => new KeyframeVisual(t, 16, 16, 60, 177, 12, 0))),
-            "tinted dark lead-in majority" => Roll((20, 37.5, 95, t => new KeyframeVisual(t, 16, 16, 32, 150, 3, 0)), (38, 54, 95, KeyframeVisuals.Black)),
-            "an eighth dark picture" => Roll((20, 54, 95, t => (t - 20) % 4 == 0.5 ? new KeyframeVisual(t, 16, 16, 26, 100, 2, 0) : KeyframeVisuals.Black(t))),
+            "dark picture after a black head" => Roll((20, 20, 95, new KeyframeVisual(15, 17, 19, 179, 1.1, 0)), (20.5, 54, 95, new KeyframeVisual(15, 17, 26, 100, 2, 0))),
+            "dense white text on a tint" => Roll((20, 20, 95, KeyframeVisuals.Black), (20.5, 54, 95, new KeyframeVisual(10, 16, 37, 241, 1.2, 0))),
+            "dense warm grey text" => Roll((20, 20, 95, KeyframeVisuals.Black), (20.5, 54, 95, new KeyframeVisual(16, 16, 30, 150, 0.9, 0))),
+            "dense coloured text" => Roll((20, 20, 95, KeyframeVisuals.Black), (20.5, 54, 95, new KeyframeVisual(16, 16, 60, 177, 12, 0))),
+            "tinted dark lead-in majority" => Roll((20, 37.5, 95, new KeyframeVisual(16, 16, 32, 150, 3, 0)), (38, 54, 95, KeyframeVisuals.Black)),
+            "an eighth dark picture" => [.. Times(20, 54, 0.5).Select(t => new Keyframe(t, 95, (t - 20) % 4 == 0.5 ? new KeyframeVisual(16, 16, 26, 100, 2, 0) : KeyframeVisuals.Black))],
             _ => throw new ArgumentOutOfRangeException(nameof(visualsKind)),
         };
         var ffmpeg = KeyframeScan(keyframes);
@@ -507,7 +502,7 @@ public class TestBlackFrames
         (SegmentSource, double, double)[] expected = expectedStart is { } start ? [(SegmentSource.BlackFrame, start, 154)] : [];
         Assert.Equal(expected, candidates);
 
-        static Keyframe[] Roll(params (double From, double To, int Percentage, Func<double, KeyframeVisual?> Visual)[] spans)
+        static Keyframe[] Roll(params (double From, double To, int Percentage, KeyframeVisual? Visual)[] spans)
             => Keyframes(20, 54, 0.5, spans);
     }
 
@@ -589,24 +584,6 @@ public class TestBlackFrames
     }
 
     [Fact]
-    public async Task DetectCreditsAsync_CutStartCachedUnderBlackFrameTimes_IsRead()
-    {
-        // Every black-frame row sits 0.4 ms after its visual. The cut start keys its cache row on
-        // the pages' black-frame times, 28.0004 and 30.0004, so a start stored under them is read
-        // and nothing is decoded.
-        var ffmpeg = KeyframeScan(CutAfterDarkGreyLeadIn().Select(keyframe => keyframe with { Time = keyframe.Time + 0.0004 }));
-        var cache = DatabaseTestHelpers.CreateTempCacheService();
-        var episode = CreateQueuedCreditsEpisode();
-        cache.Write(episode.EpisodeId, AnalysisMode.Credits, CacheEntryType.Cut, 28.0004, 30.0004, new PluginConfiguration(), [29.0]);
-        var analyzer = CreateKeyframeAnalyzer(ffmpeg, new PluginConfiguration { RefineCreditsBoundary = true }, cache);
-
-        var candidates = await KeyframeCandidates(analyzer, episode);
-
-        Assert.Equal([(SegmentSource.BlackFrame, 29.0, 54.0004)], candidates);
-        Assert.Empty(ffmpeg.Calls);
-    }
-
-    [Fact]
     public async Task DetectCreditsAsync_WithoutBoundaryRefinement_DecodesNoCut()
     {
         // Keyframe-only analysis: the lead-in still trims to the keyframe at 30, and nothing between
@@ -677,7 +654,7 @@ public class TestBlackFrames
     {
         // The pages under the black minimum after the scene each fail one roll page clause, so the
         // scene ends at its last black keyframe.
-        var ffmpeg = KeyframeScan(Keyframes(0, 90, 2, (0, 18, 0, KeyframeVisuals.Content), (20, 40, 95, KeyframeVisuals.Black), (42, 80, 80, t => new KeyframeVisual(t, 16, lumaLow, lumaHigh, lumaMax, saturation, 0)), (82, 90, 0, KeyframeVisuals.Content)));
+        var ffmpeg = KeyframeScan(Keyframes(0, 90, 2, (0, 18, 0, KeyframeVisuals.Content), (20, 40, 95, KeyframeVisuals.Black), (42, 80, 80, new KeyframeVisual(16, lumaLow, lumaHigh, lumaMax, saturation, 0)), (82, 90, 0, KeyframeVisuals.Content)));
         var analyzer = CreateKeyframeAnalyzer(ffmpeg, new PluginConfiguration { RefineCreditsBoundary = false });
         var episode = CreateQueuedCreditsEpisode(creditsFingerprintStart: 100);
 
@@ -698,28 +675,6 @@ public class TestBlackFrames
         var candidates = await KeyframeCandidates(analyzer, episode);
 
         Assert.Equal([(SegmentSource.BlackFrame, 130.0, 160.0)], candidates);
-    }
-
-    [Fact]
-    public async Task DetectCreditsAsync_FrameCounterRestart_KeepsTheRoll()
-    {
-        // The roll above, 100 s later, with the roll's first page on a cut as in the trimmed scene
-        // fixture. ffmpeg rebuilds the filtergraph at 100 and at 150, as it does when the video
-        // changes resolution, and the blackframe counter starts over at 0 at each, so a page's frame
-        // number no longer says where it is. The lead-in still trims the scene to its page at 130,
-        // the cut decode still reads the gap before that page, and the scene still ends on its roll
-        // pages at 160.
-        var pages = Pages(Keyframes(0, 180, 2, (0, 118, 0, KeyframeVisuals.Content), (120, 128, 95, KeyframeVisuals.DarkGrey), (130, 130, 95, KeyframeVisuals.BlackAfterCut), (132, 140, 95, KeyframeVisuals.Black), (142, 160, 80, KeyframeVisuals.DenseText), (162, 180, 0, KeyframeVisuals.Content)))
-            .Select((page, i) => page with { Frame = page.Frame with { Frame = page.Frame.Time < 100 ? i : page.Frame.Time < 150 ? i - 50 : i - 75 } })
-            .ToArray();
-        var ffmpeg = new StubFFmpegService { KeyframeScan = (_, _) => pages, CutWindows = (_, window) => CutFrames(window, cutFrame: 24) };
-        var analyzer = CreateKeyframeAnalyzer(ffmpeg, new PluginConfiguration { RefineCreditsBoundary = true });
-        var episode = CreateQueuedCreditsEpisode(creditsFingerprintStart: 100);
-
-        var candidates = await KeyframeCandidates(analyzer, episode);
-
-        Assert.Equal([(SegmentSource.BlackFrame, 229.0, 260.0)], candidates);
-        Assert.Equal([new CutDecode(228, 230)], ffmpeg.Calls);
     }
 
     [Theory]
@@ -779,10 +734,10 @@ public class TestBlackFrames
     [Fact]
     public async Task DetectCreditsAsync_SceneWithoutVisualEvidenceIsKept()
     {
-        // A roll whose keyframes the visuals decode did not report, after content keyframes it did.
+        // A roll whose keyframes have no visual, after content keyframes that do.
         // The gates find no visual on any of the roll's pages and must leave the black-frame result
         // alone rather than reject the roll on a zero count.
-        var ffmpeg = KeyframeScan(Keyframes(0, 54, 0.5, (20, 54, 95, _ => null)));
+        var ffmpeg = KeyframeScan(Keyframes(0, 54, 0.5, (20, 54, 95, null)));
         var analyzer = CreateKeyframeAnalyzer(ffmpeg, new PluginConfiguration { RefineCreditsBoundary = false });
         var episode = CreateQueuedCreditsEpisode(creditsFingerprintStart: 100);
 
@@ -804,7 +759,7 @@ public class TestBlackFrames
         var keyframes = visualsKind switch
         {
             "one page" => Keyframes(20, 54, 0.5, (30, 30, 95, KeyframeVisuals.Black), (20, 54, 95, KeyframeVisuals.BlankBlack)),
-            "half the pages" => Keyframes(20, 54, 0.5, (20, 54, 95, t => (t - 20) % 1 == 0 ? KeyframeVisuals.BlankBlack(t) : KeyframeVisuals.Black(t))),
+            "half the pages" => [.. Times(20, 54, 0.5).Select(t => new Keyframe(t, 95, (t - 20) % 1 == 0 ? KeyframeVisuals.BlankBlack : KeyframeVisuals.Black))],
             "dark room" => Keyframes(20, 54, 0.5, (20, 54, 95, KeyframeVisuals.DarkRoom)),
             _ => Keyframes(20, 54, 0.5, (20, 37, 95, KeyframeVisuals.BlankBlack), (37.5, 54, 95, KeyframeVisuals.DarkHighlight)),
         };
@@ -832,7 +787,7 @@ public class TestBlackFrames
         // Red lettering on black swept across font sizes: the 90th percentile climbs from the
         // background onto the text as the lettering thickens, and every size is lettering. Only the
         // contrast decides: a page whose brightest pixel is under 60 levels above the darkest tenth is blank.
-        var visual = new KeyframeVisual(0, 16, 16, 16 + spread, max, 11, 0);
+        var visual = new KeyframeVisual(16, 16, 16 + spread, max, 11, 0);
 
         Assert.Equal(expected, visual.IsLettered());
     }
@@ -846,9 +801,9 @@ public class TestBlackFrames
         // confirmed blackdetect interval and should remain a credits candidate.
         Keyframe[] keyframes =
         [
-            new(0, 10, KeyframeVisuals.Content(0)),
+            new(0, 10, KeyframeVisuals.Content),
             .. Keyframes(10, 30, 10, (10, 30, 96, KeyframeVisuals.Black)),
-            new(100, 10, KeyframeVisuals.Content(100)),
+            new(100, 10, KeyframeVisuals.Content),
             .. Keyframes(110, 130, 10, (110, 130, 96, KeyframeVisuals.Black)),
         ];
         var ffmpeg = KeyframeScan(keyframes, intervals: [new BlackInterval(10, 30)]);
@@ -869,9 +824,9 @@ public class TestBlackFrames
         // scan covers both. The probe changes nothing, and both scenes are candidates.
         Keyframe[] keyframes =
         [
-            new(0, 10, KeyframeVisuals.Content(0)),
+            new(0, 10, KeyframeVisuals.Content),
             .. Keyframes(10, 30, 10, (10, 30, 96, KeyframeVisuals.Black)),
-            new(45, 10, KeyframeVisuals.Content(45)),
+            new(45, 10, KeyframeVisuals.Content),
             .. Keyframes(55, 75, 10, (55, 75, 96, KeyframeVisuals.Black)),
         ];
         var ffmpeg = KeyframeScan(keyframes, intervals: [new BlackInterval(0, 1)]);
@@ -891,9 +846,9 @@ public class TestBlackFrames
         // the card run covers the cards and the roll after them.
         Keyframe[] keyframes =
         [
-            new(0, 0, KeyframeVisuals.Content(0)),
+            new(0, 0, KeyframeVisuals.Content),
             .. Keyframes(10, 30, 10, (10, 30, 96, KeyframeVisuals.Black)),
-            new(60, 0, KeyframeVisuals.Content(60)),
+            new(60, 0, KeyframeVisuals.Content),
             .. Keyframes(90, 98, 2, (90, 98, 0, KeyframeVisuals.Card)),
             .. Keyframes(100, 130, 2, (100, 130, 96, KeyframeVisuals.Black)),
         ];
@@ -1013,12 +968,12 @@ public class TestBlackFrames
         // earlier of the interval start and the cut frame.
         var ffmpeg = KeyframeScan(
             [
-                new(366.45, 15, KeyframeVisuals.Dark(366.45)),
-                new(376.46, 96, KeyframeVisuals.BlackAfterCut(376.46)),
-                new(386.47, 96, KeyframeVisuals.Black(386.47)),
-                new(396.48, 98, KeyframeVisuals.Black(396.48)),
-                new(406.49, 99, KeyframeVisuals.Black(406.49)),
-                new(416.5, 20, KeyframeVisuals.Dark(416.5)),
+                new(366.45, 15, KeyframeVisuals.Dark),
+                new(376.46, 96, KeyframeVisuals.BlackAfterCut),
+                new(386.47, 96, KeyframeVisuals.Black),
+                new(396.48, 98, KeyframeVisuals.Black),
+                new(406.49, 99, KeyframeVisuals.Black),
+                new(416.5, 20, KeyframeVisuals.Dark),
             ],
             intervals: [new BlackInterval(367.827, 376.002)],
             cutWindows: (_, window) => CutFrames(window, cutFrame));
@@ -1104,8 +1059,8 @@ public class TestBlackFrames
         var ffmpeg = KeyframeScan(
             times.Select(t => t switch
             {
-                >= 20 and <= 40 or >= 70 and <= 90 => new Keyframe(t, 100, KeyframeVisuals.Black(t)),
-                _ => new Keyframe(t, 0, KeyframeVisuals.Content(t)),
+                >= 20 and <= 40 or >= 70 and <= 90 => new Keyframe(t, 100, KeyframeVisuals.Black),
+                _ => new Keyframe(t, 0, KeyframeVisuals.Content),
             }),
             intervals: oneInterval ? [new BlackInterval(19, 90)] : [new BlackInterval(19, 40), new BlackInterval(65, 90)]);
         var analyzer = CreateKeyframeAnalyzer(ffmpeg, new PluginConfiguration { RefineCreditsBoundary = false });
@@ -1176,10 +1131,10 @@ public class TestBlackFrames
     {
         var ffmpeg = KeyframeScan(
             [
-                new(366.45, 15, KeyframeVisuals.Dark(366.45)),
-                new(376.46, 20, KeyframeVisuals.Dark(376.46)),
-                new(386.47, 18, KeyframeVisuals.Dark(386.47)),
-                new(396.48, 22, KeyframeVisuals.Dark(396.48)),
+                new(366.45, 15, KeyframeVisuals.Dark),
+                new(376.46, 20, KeyframeVisuals.Dark),
+                new(386.47, 18, KeyframeVisuals.Dark),
+                new(396.48, 22, KeyframeVisuals.Dark),
             ],
             intervals: [new BlackInterval(367.827, 376.002)]);
         var analyzer = CreateKeyframeAnalyzer(ffmpeg);
@@ -1253,7 +1208,7 @@ public class TestBlackFrames
         // ends the lead-in walk, since nothing says it is dim. So the dim page alone is the lead-in,
         // and the scene starts on the page without a visual at 22, not on the first level page at
         // 24. Without a visual that page has no frame difference, so no cut is decoded before it.
-        var ffmpeg = KeyframeScan(Keyframes(0, 70, 2, (20, 20, 95, KeyframeVisuals.DarkGrey), (22, 22, 95, _ => null), (24, 54, 95, KeyframeVisuals.Black)));
+        var ffmpeg = KeyframeScan(Keyframes(0, 70, 2, (20, 20, 95, KeyframeVisuals.DarkGrey), (22, 22, 95, null), (24, 54, 95, KeyframeVisuals.Black)));
         var analyzer = CreateKeyframeAnalyzer(ffmpeg);
 
         var candidates = await KeyframeCandidates(analyzer, CreateQueuedCreditsEpisode(creditsFingerprintStart: 100));
@@ -1312,8 +1267,8 @@ public class TestBlackFrames
             2,
             (32, 40, 0, KeyframeVisuals.Card),
             (42, 54, 100, KeyframeVisuals.Black),
-            (82, 110, 100, _ => null),
-            (62, 120, 0, _ => null)));
+            (82, 110, 100, null),
+            (62, 120, 0, null)));
         var analyzer = CreateKeyframeAnalyzer(ffmpeg);
         var episode = new QueuedEpisode
         {
@@ -1377,7 +1332,7 @@ public class TestBlackFrames
         // it by 40. No page is black, so there is no black scene, and the card run starts on the cut
         // frame of the gap before its first page.
         var ffmpeg = KeyframeScan(
-            Keyframes(0, 70, 2, (30, 30, 0, t => KeyframeVisuals.Card(t) with { FrameDifference = 40 }), (32, 60, 0, KeyframeVisuals.Card)),
+            Keyframes(0, 70, 2, (30, 30, 0, KeyframeVisuals.Card with { FrameDifference = 40 }), (32, 60, 0, KeyframeVisuals.Card)),
             cutWindows: (_, window) => CutFrames(window, cutFrame: 36));
         var analyzer = CreateKeyframeAnalyzer(ffmpeg);
 
@@ -1393,7 +1348,7 @@ public class TestBlackFrames
         // The card run from DetectCreditsAsync_CardRun_StartsOnTheCut, analyzed keyframe-only: it
         // starts on its first page at 30 and nothing between the keyframes is decoded.
         var ffmpeg = KeyframeScan(
-            Keyframes(0, 70, 2, (30, 30, 0, t => KeyframeVisuals.Card(t) with { FrameDifference = 40 }), (32, 60, 0, KeyframeVisuals.Card)),
+            Keyframes(0, 70, 2, (30, 30, 0, KeyframeVisuals.Card with { FrameDifference = 40 }), (32, 60, 0, KeyframeVisuals.Card)),
             cutWindows: (_, window) => CutFrames(window, cutFrame: 36));
         var analyzer = CreateKeyframeAnalyzer(ffmpeg, new PluginConfiguration { RefineCreditsBoundary = false });
 
@@ -1410,33 +1365,33 @@ public class TestBlackFrames
     {
         // The other signalstats lines (YAVG, the U/V and hue stats) are noise to this parser.
         const string raw = """
-            [Parsed_metadata_2 @ 0x0] frame:0    pts:0       pts_time:0
-            [Parsed_metadata_2 @ 0x0] lavfi.signalstats.YMIN=16
-            [Parsed_metadata_2 @ 0x0] lavfi.signalstats.YLOW=60
-            [Parsed_metadata_2 @ 0x0] lavfi.signalstats.YAVG=130.5
-            [Parsed_metadata_2 @ 0x0] lavfi.signalstats.YHIGH=200
-            [Parsed_metadata_2 @ 0x0] lavfi.signalstats.YMAX=235
-            [Parsed_metadata_2 @ 0x0] lavfi.signalstats.UMIN=90
-            [Parsed_metadata_2 @ 0x0] lavfi.signalstats.SATLOW=0
-            [Parsed_metadata_2 @ 0x0] lavfi.signalstats.SATAVG=108.199
-            [Parsed_metadata_2 @ 0x0] lavfi.signalstats.HUEAVG=180
-            [Parsed_metadata_2 @ 0x0] lavfi.signalstats.YDIF=0
-            [Parsed_metadata_2 @ 0x0] frame:1    pts:20480   pts_time:2
-            [Parsed_metadata_2 @ 0x0] lavfi.signalstats.YMIN=16
-            [Parsed_metadata_2 @ 0x0] lavfi.signalstats.YLOW=16
-            [Parsed_metadata_2 @ 0x0] lavfi.signalstats.YAVG=16
-            [Parsed_metadata_2 @ 0x0] lavfi.signalstats.YHIGH=16
-            [Parsed_metadata_2 @ 0x0] lavfi.signalstats.YMAX=235
-            [Parsed_metadata_2 @ 0x0] lavfi.signalstats.SATLOW=0
-            [Parsed_metadata_2 @ 0x0] lavfi.signalstats.SATAVG=0
-            [Parsed_metadata_2 @ 0x0] lavfi.signalstats.YDIF=101.5
+            [metadata@TOKEN @ 0x0] frame:0    pts:0       pts_time:0
+            [metadata@TOKEN @ 0x0] lavfi.signalstats.YMIN=16
+            [metadata@TOKEN @ 0x0] lavfi.signalstats.YLOW=60
+            [metadata@TOKEN @ 0x0] lavfi.signalstats.YAVG=130.5
+            [metadata@TOKEN @ 0x0] lavfi.signalstats.YHIGH=200
+            [metadata@TOKEN @ 0x0] lavfi.signalstats.YMAX=235
+            [metadata@TOKEN @ 0x0] lavfi.signalstats.UMIN=90
+            [metadata@TOKEN @ 0x0] lavfi.signalstats.SATLOW=0
+            [metadata@TOKEN @ 0x0] lavfi.signalstats.SATAVG=108.199
+            [metadata@TOKEN @ 0x0] lavfi.signalstats.HUEAVG=180
+            [metadata@TOKEN @ 0x0] lavfi.signalstats.YDIF=0
+            [metadata@TOKEN @ 0x0] frame:1    pts:20480   pts_time:2
+            [metadata@TOKEN @ 0x0] lavfi.signalstats.YMIN=16
+            [metadata@TOKEN @ 0x0] lavfi.signalstats.YLOW=16
+            [metadata@TOKEN @ 0x0] lavfi.signalstats.YAVG=16
+            [metadata@TOKEN @ 0x0] lavfi.signalstats.YHIGH=16
+            [metadata@TOKEN @ 0x0] lavfi.signalstats.YMAX=235
+            [metadata@TOKEN @ 0x0] lavfi.signalstats.SATLOW=0
+            [metadata@TOKEN @ 0x0] lavfi.signalstats.SATAVG=0
+            [metadata@TOKEN @ 0x0] lavfi.signalstats.YDIF=101.5
             """;
 
-        var visuals = FFmpegOutputParser.ParseKeyframeVisuals(raw);
+        var visuals = FFmpegOutputParser.ParseKeyframeVisuals(raw, new FilterInstance("metadata@TOKEN"));
 
         Assert.Equal(2, visuals.Length);
-        Assert.Equal(new KeyframeVisual(0.0, 16, 60, 200, 235, 108.199, 0), visuals[0]);
-        Assert.Equal(new KeyframeVisual(2.0, 16, 16, 16, 235, 0, 101.5), visuals[1]);
+        Assert.Equal(new CutFrame(0.0, new KeyframeVisual(16, 60, 200, 235, 108.199, 0)), visuals[0]);
+        Assert.Equal(new CutFrame(2.0, new KeyframeVisual(16, 16, 16, 235, 0, 101.5)), visuals[1]);
     }
 
     [Fact]
@@ -1446,38 +1401,38 @@ public class TestBlackFrames
         // the cut to the blank black page at 300 s differs from the keyframe before by 45. UDIF and
         // VDIF are the chroma differences, which the parser leaves alone.
         const string raw = """
-            [Parsed_metadata_2 @ 00000191857e6dc0] frame:30   pts:3840000 pts_time:300
-            [Parsed_metadata_2 @ 00000191857e6dc0] lavfi.signalstats.YMIN=16
-            [Parsed_metadata_2 @ 00000191857e6dc0] lavfi.signalstats.YLOW=16
-            [Parsed_metadata_2 @ 00000191857e6dc0] lavfi.signalstats.YAVG=16
-            [Parsed_metadata_2 @ 00000191857e6dc0] lavfi.signalstats.YHIGH=16
-            [Parsed_metadata_2 @ 00000191857e6dc0] lavfi.signalstats.YMAX=16
-            [Parsed_metadata_2 @ 00000191857e6dc0] lavfi.signalstats.UMIN=128
-            [Parsed_metadata_2 @ 00000191857e6dc0] lavfi.signalstats.ULOW=128
-            [Parsed_metadata_2 @ 00000191857e6dc0] lavfi.signalstats.UAVG=128
-            [Parsed_metadata_2 @ 00000191857e6dc0] lavfi.signalstats.UHIGH=128
-            [Parsed_metadata_2 @ 00000191857e6dc0] lavfi.signalstats.UMAX=128
-            [Parsed_metadata_2 @ 00000191857e6dc0] lavfi.signalstats.VMIN=128
-            [Parsed_metadata_2 @ 00000191857e6dc0] lavfi.signalstats.VLOW=128
-            [Parsed_metadata_2 @ 00000191857e6dc0] lavfi.signalstats.VAVG=128
-            [Parsed_metadata_2 @ 00000191857e6dc0] lavfi.signalstats.VHIGH=128
-            [Parsed_metadata_2 @ 00000191857e6dc0] lavfi.signalstats.VMAX=128
-            [Parsed_metadata_2 @ 00000191857e6dc0] lavfi.signalstats.SATMIN=0
-            [Parsed_metadata_2 @ 00000191857e6dc0] lavfi.signalstats.SATLOW=0
-            [Parsed_metadata_2 @ 00000191857e6dc0] lavfi.signalstats.SATAVG=0
-            [Parsed_metadata_2 @ 00000191857e6dc0] lavfi.signalstats.SATHIGH=0
-            [Parsed_metadata_2 @ 00000191857e6dc0] lavfi.signalstats.SATMAX=0
-            [Parsed_metadata_2 @ 00000191857e6dc0] lavfi.signalstats.HUEMED=180
-            [Parsed_metadata_2 @ 00000191857e6dc0] lavfi.signalstats.HUEAVG=180
-            [Parsed_metadata_2 @ 00000191857e6dc0] lavfi.signalstats.YDIF=45
-            [Parsed_metadata_2 @ 00000191857e6dc0] lavfi.signalstats.UDIF=37
-            [Parsed_metadata_2 @ 00000191857e6dc0] lavfi.signalstats.VDIF=47
-            [Parsed_metadata_2 @ 00000191857e6dc0] lavfi.signalstats.YBITDEPTH=1
+            [metadata@TOKEN @ 00000191857e6dc0] frame:30   pts:3840000 pts_time:300
+            [metadata@TOKEN @ 00000191857e6dc0] lavfi.signalstats.YMIN=16
+            [metadata@TOKEN @ 00000191857e6dc0] lavfi.signalstats.YLOW=16
+            [metadata@TOKEN @ 00000191857e6dc0] lavfi.signalstats.YAVG=16
+            [metadata@TOKEN @ 00000191857e6dc0] lavfi.signalstats.YHIGH=16
+            [metadata@TOKEN @ 00000191857e6dc0] lavfi.signalstats.YMAX=16
+            [metadata@TOKEN @ 00000191857e6dc0] lavfi.signalstats.UMIN=128
+            [metadata@TOKEN @ 00000191857e6dc0] lavfi.signalstats.ULOW=128
+            [metadata@TOKEN @ 00000191857e6dc0] lavfi.signalstats.UAVG=128
+            [metadata@TOKEN @ 00000191857e6dc0] lavfi.signalstats.UHIGH=128
+            [metadata@TOKEN @ 00000191857e6dc0] lavfi.signalstats.UMAX=128
+            [metadata@TOKEN @ 00000191857e6dc0] lavfi.signalstats.VMIN=128
+            [metadata@TOKEN @ 00000191857e6dc0] lavfi.signalstats.VLOW=128
+            [metadata@TOKEN @ 00000191857e6dc0] lavfi.signalstats.VAVG=128
+            [metadata@TOKEN @ 00000191857e6dc0] lavfi.signalstats.VHIGH=128
+            [metadata@TOKEN @ 00000191857e6dc0] lavfi.signalstats.VMAX=128
+            [metadata@TOKEN @ 00000191857e6dc0] lavfi.signalstats.SATMIN=0
+            [metadata@TOKEN @ 00000191857e6dc0] lavfi.signalstats.SATLOW=0
+            [metadata@TOKEN @ 00000191857e6dc0] lavfi.signalstats.SATAVG=0
+            [metadata@TOKEN @ 00000191857e6dc0] lavfi.signalstats.SATHIGH=0
+            [metadata@TOKEN @ 00000191857e6dc0] lavfi.signalstats.SATMAX=0
+            [metadata@TOKEN @ 00000191857e6dc0] lavfi.signalstats.HUEMED=180
+            [metadata@TOKEN @ 00000191857e6dc0] lavfi.signalstats.HUEAVG=180
+            [metadata@TOKEN @ 00000191857e6dc0] lavfi.signalstats.YDIF=45
+            [metadata@TOKEN @ 00000191857e6dc0] lavfi.signalstats.UDIF=37
+            [metadata@TOKEN @ 00000191857e6dc0] lavfi.signalstats.VDIF=47
+            [metadata@TOKEN @ 00000191857e6dc0] lavfi.signalstats.YBITDEPTH=1
             """;
 
-        var visual = Assert.Single(FFmpegOutputParser.ParseKeyframeVisuals(raw));
+        var visual = Assert.Single(FFmpegOutputParser.ParseKeyframeVisuals(raw, new FilterInstance("metadata@TOKEN")));
 
-        Assert.Equal(new KeyframeVisual(300, 16, 16, 16, 16, 0, 45), visual);
+        Assert.Equal(new CutFrame(300, new KeyframeVisual(16, 16, 16, 16, 0, 45)), visual);
     }
 
     [Fact]
@@ -1487,29 +1442,52 @@ public class TestBlackFrames
         // than emitted with zeros: a zero saturation passes the credit-card gate and a zero spread
         // would fabricate a card.
         const string raw = """
-            [Parsed_metadata_2 @ 0x0] frame:0 pts:0 pts_time:5
-            [Parsed_metadata_2 @ 0x0] lavfi.signalstats.YMIN=16
-            [Parsed_metadata_2 @ 0x0] lavfi.signalstats.YLOW=128
-            [Parsed_metadata_2 @ 0x0] lavfi.signalstats.YHIGH=128
-            [Parsed_metadata_2 @ 0x0] lavfi.signalstats.YMAX=235
-            [Parsed_metadata_2 @ 0x0] lavfi.signalstats.SATAVG=12.5
-            [Parsed_metadata_2 @ 0x0] lavfi.signalstats.YDIF=3
-            [Parsed_metadata_2 @ 0x0] frame:1 pts:1 pts_time:7
-            [Parsed_metadata_2 @ 0x0] lavfi.signalstats.YMIN=16
-            [Parsed_metadata_2 @ 0x0] lavfi.signalstats.YLOW=128
-            [Parsed_metadata_2 @ 0x0] lavfi.signalstats.YMAX=235
-            [Parsed_metadata_2 @ 0x0] lavfi.signalstats.SATAVG=12.5
-            [Parsed_metadata_2 @ 0x0] lavfi.signalstats.YDIF=3
-            [Parsed_metadata_2 @ 0x0] frame:2 pts:2 pts_time:9
-            [Parsed_metadata_2 @ 0x0] lavfi.signalstats.YMIN=16
-            [Parsed_metadata_2 @ 0x0] lavfi.signalstats.YLOW=128
-            [Parsed_metadata_2 @ 0x0] lavfi.signalstats.YHIGH=128
-            [Parsed_metadata_2 @ 0x0] lavfi.signalstats.YMAX=235
+            [metadata@TOKEN @ 0x0] frame:0 pts:0 pts_time:5
+            [metadata@TOKEN @ 0x0] lavfi.signalstats.YMIN=16
+            [metadata@TOKEN @ 0x0] lavfi.signalstats.YLOW=128
+            [metadata@TOKEN @ 0x0] lavfi.signalstats.YHIGH=128
+            [metadata@TOKEN @ 0x0] lavfi.signalstats.YMAX=235
+            [metadata@TOKEN @ 0x0] lavfi.signalstats.SATAVG=12.5
+            [metadata@TOKEN @ 0x0] lavfi.signalstats.YDIF=3
+            [metadata@TOKEN @ 0x0] frame:1 pts:1 pts_time:7
+            [metadata@TOKEN @ 0x0] lavfi.signalstats.YMIN=16
+            [metadata@TOKEN @ 0x0] lavfi.signalstats.YLOW=128
+            [metadata@TOKEN @ 0x0] lavfi.signalstats.YMAX=235
+            [metadata@TOKEN @ 0x0] lavfi.signalstats.SATAVG=12.5
+            [metadata@TOKEN @ 0x0] lavfi.signalstats.YDIF=3
+            [metadata@TOKEN @ 0x0] frame:2 pts:2 pts_time:9
+            [metadata@TOKEN @ 0x0] lavfi.signalstats.YMIN=16
+            [metadata@TOKEN @ 0x0] lavfi.signalstats.YLOW=128
+            [metadata@TOKEN @ 0x0] lavfi.signalstats.YHIGH=128
+            [metadata@TOKEN @ 0x0] lavfi.signalstats.YMAX=235
             """;
 
-        var visual = Assert.Single(FFmpegOutputParser.ParseKeyframeVisuals(raw));
+        var visual = Assert.Single(FFmpegOutputParser.ParseKeyframeVisuals(raw, new FilterInstance("metadata@TOKEN")));
 
-        Assert.Equal(new KeyframeVisual(5.0, 16, 128, 128, 235, 12.5, 3), visual);
+        Assert.Equal(new CutFrame(5.0, new KeyframeVisual(16, 128, 128, 235, 12.5, 3)), visual);
+    }
+
+    [Fact]
+    public void TestParseKeyframeVisuals_IgnoresFrameMetadataShapedLikeAHeader()
+    {
+        // metadata=print also prints the metadata a decoder attached to the frame, such as a PNG
+        // frame's text chunks, as key=value under the instance's own context and before the
+        // signalstats keys. Neither entry here may start a block and retime the frame's stats.
+        const string raw = """
+            [metadata@TOKEN @ 0x0] frame:0    pts:0       pts_time:0
+            [metadata@TOKEN @ 0x0] frame:7 pts:0=x pts_time:0.5
+            [metadata@TOKEN @ 0x0] frame:9 pts:9 pts_time:0.75=x
+            [metadata@TOKEN @ 0x0] lavfi.signalstats.YMIN=16
+            [metadata@TOKEN @ 0x0] lavfi.signalstats.YLOW=16
+            [metadata@TOKEN @ 0x0] lavfi.signalstats.YHIGH=16
+            [metadata@TOKEN @ 0x0] lavfi.signalstats.YMAX=235
+            [metadata@TOKEN @ 0x0] lavfi.signalstats.SATAVG=0
+            [metadata@TOKEN @ 0x0] lavfi.signalstats.YDIF=0
+            """;
+
+        var frame = Assert.Single(FFmpegOutputParser.ParseKeyframeVisuals(raw, new FilterInstance("metadata@TOKEN")));
+
+        Assert.Equal(new CutFrame(0, new KeyframeVisual(16, 16, 16, 235, 0, 0)), frame);
     }
 
     [Fact]
@@ -1519,42 +1497,42 @@ public class TestBlackFrames
         // numeric token must be parsed, not truncated at the mantissa, which would feed corrupt
         // values into detection and the cache.
         const string raw = """
-            [Parsed_metadata_2 @ 0x0] frame:0 pts:0 pts_time:1e-05
-            [Parsed_metadata_2 @ 0x0] lavfi.signalstats.YMIN=1.6e+01
-            [Parsed_metadata_2 @ 0x0] lavfi.signalstats.YLOW=1.28e+02
-            [Parsed_metadata_2 @ 0x0] lavfi.signalstats.YHIGH=1.28e+02
-            [Parsed_metadata_2 @ 0x0] lavfi.signalstats.YMAX=2.35e+02
-            [Parsed_metadata_2 @ 0x0] lavfi.signalstats.SATAVG=3.2e+01
-            [Parsed_metadata_2 @ 0x0] lavfi.signalstats.YDIF=1.5e+01
-            [Parsed_metadata_2 @ 0x0] frame:1 pts:1 pts_time:2
+            [metadata@TOKEN @ 0x0] frame:0 pts:0 pts_time:1e-05
+            [metadata@TOKEN @ 0x0] lavfi.signalstats.YMIN=1.6e+01
+            [metadata@TOKEN @ 0x0] lavfi.signalstats.YLOW=1.28e+02
+            [metadata@TOKEN @ 0x0] lavfi.signalstats.YHIGH=1.28e+02
+            [metadata@TOKEN @ 0x0] lavfi.signalstats.YMAX=2.35e+02
+            [metadata@TOKEN @ 0x0] lavfi.signalstats.SATAVG=3.2e+01
+            [metadata@TOKEN @ 0x0] lavfi.signalstats.YDIF=1.5e+01
+            [metadata@TOKEN @ 0x0] frame:1 pts:1 pts_time:2
             """;
 
-        var visual = Assert.Single(FFmpegOutputParser.ParseKeyframeVisuals(raw));
+        var visual = Assert.Single(FFmpegOutputParser.ParseKeyframeVisuals(raw, new FilterInstance("metadata@TOKEN")));
 
-        Assert.Equal(new KeyframeVisual(1e-05, 16, 128, 128, 235, 32, 15), visual);
+        Assert.Equal(new CutFrame(1e-05, new KeyframeVisual(16, 128, 128, 235, 32, 15)), visual);
     }
 
     // Each row: a keyframe visual and whether it is card-like.
     public static TheoryData<KeyframeVisual, bool> CardLikeCases => new()
     {
-        { KeyframeVisuals.Card(0), true },
-        { KeyframeVisuals.WhiteCard(0), true },
+        { KeyframeVisuals.Card, true },
+        { KeyframeVisuals.WhiteCard, true },
 
         // Spread 9: the background is not dominant.
-        { new KeyframeVisual(0, 16, 128, 137, 235, 30, 0), false },
+        { new KeyframeVisual(16, 128, 137, 235, 30, 0), false },
 
         // Spread 8 with contrast 60 on both sides: both boundaries inclusive.
-        { new KeyframeVisual(0, 68, 128, 136, 196, 30, 0), true },
+        { new KeyframeVisual(68, 128, 136, 196, 30, 0), true },
 
         // Contrast 59: a bare wall or a fade.
-        { new KeyframeVisual(0, 69, 128, 128, 187, 30, 0), false },
+        { new KeyframeVisual(69, 128, 128, 187, 30, 0), false },
 
-        { KeyframeVisuals.BlankBlack(0), false },
-        { KeyframeVisuals.Dark(0), false },
-        { KeyframeVisuals.FlatWithSubject(0), false },
+        { KeyframeVisuals.BlankBlack, false },
+        { KeyframeVisuals.Dark, false },
+        { KeyframeVisuals.FlatWithSubject, false },
 
         // Card at the exclusive saturation maximum.
-        { KeyframeVisuals.Card(0, saturation: 96), false },
+        { KeyframeVisuals.Card with { Saturation = 96 }, false },
     };
 
     [Theory]
@@ -1594,11 +1572,11 @@ public class TestBlackFrames
 
         // An earlier dense run (0-20) must not capture or extend into a later long-GOP credit run
         // (60-96, 12s cadence): the 40 s gap between them breaks the run, so the latest is returned.
-        { Pages(NotBlack([.. Cards(0, 20, 2), .. Busy(22, 58, 2), .. Cards(60, 96, 12)])), 15, (60, 96) },
+        { Pages([.. Cards(0, 20, 2), .. Busy(22, 58, 2), .. Cards(60, 96, 12)]), 15, (60, 96) },
 
         // Dense non-card content, then static cards on a 12s-keyframe source: grouping must key off the
         // card cadence, not the content cadence, or every 12s card gap splits the run.
-        { Pages(NotBlack([.. Busy(0, 58, 2), .. Cards(60, 96, 12)])), 15, (60, 96) },
+        { Pages([.. Busy(0, 58, 2), .. Cards(60, 96, 12)]), 15, (60, 96) },
 
         // Sparse isolated cards bridged across busy 2s content (brief dense head, then a lone card
         // every 8s) -> rejected by the card-density floor: most keyframes in the span are busy
@@ -1616,10 +1594,10 @@ public class TestBlackFrames
 
         // Dark (low luma) but detailed content spreads wide within the dark range, like a night scene -> not a card.
         // Its percentiles put it between a tenth and nine tenths black, so its rows sit at 50, under the minimum.
-        { Pages(Times(0, 58, 2).Select(t => new Keyframe(t, 50, KeyframeVisuals.Dark(t)))), 15, null },
+        { Pages(Times(0, 58, 2).Select(t => new Keyframe(t, 50, KeyframeVisuals.Dark))), 15, null },
 
         // Uniform but vividly saturated frames are excluded on purpose (see KeyframeVisualTraits).
-        { Pages(NotBlack(CreateCardCreditVisuals(cardStart: 0, cardEnd: 20, cardSaturation: 200))), 15, null },
+        { Pages(NotBlack(0, 20, 2, KeyframeVisuals.Card with { Saturation = 200 })), 15, null },
 
         // All busy content -> null.
         { Pages(Seq(60, 2)), 15, null },
@@ -1642,7 +1620,7 @@ public class TestBlackFrames
         Assert.Equal(expected.Value.End, range.End);
     }
 
-    // Each row: the keyframe scan (one black row and one visual per keyframe); the black scenes the
+    // Each row: the keyframe scan (one page per keyframe); the black scenes the
     // black-frame rules accepted, empty when they found no credits; the lead-ins and scenes they
     // rejected; the expected (Start, End) or null.
     public static TheoryData<KeyframePage[], (double Start, double End)[], (double Start, double End)[], (double Start, double End)?> BlackKeyframeCases
@@ -1665,34 +1643,16 @@ public class TestBlackFrames
                 (68, 118, 100, KeyframeVisuals.Black));
             data.Add(Pages(epilogue), [(68, 118)], [], null);
 
-            // Grey cards then a roll: the black cards extend the run. Every black-frame row sits 0.4 ms
-            // after its visual, as the two ffmpeg filters can print them, and the run is timed on the
-            // rows. The accepted scene ends at 80, so the last roll page belongs to it through the
-            // membership pad.
+            // Grey cards then a roll: the black cards extend the run. The accepted scene ends just
+            // before the last roll page, on blackdetect's clock, so that page belongs to it through
+            // the membership pad.
             var cardsThenRoll = Keyframes(0, 80, 2, (0, 40, 0, KeyframeVisuals.Card), (42, 80, 100, KeyframeVisuals.Black));
-            data.Add(Pages(cardsThenRoll.Select(keyframe => keyframe with { Time = keyframe.Time + 0.0004 })), [(42, 80)], [], (0.0004, 80.0004));
-
-            // Cards 15 s apart on the visual clock, which FFmpeg before 7.0 rounds to six significant
-            // digits, with their black-frame rows a fraction of a millisecond later: 14.9998 s apart on
-            // the black-frame clock the run is timed on, so the run falls short of the 15 s minimum.
-            data.Add(
-                Pages(
-                [
-                    .. Keyframes(90, 98, 2),
-                    new(100.0004, 0, KeyframeVisuals.Card(100)),
-                    new(105.0003, 0, KeyframeVisuals.Card(105)),
-                    new(110.0003, 0, KeyframeVisuals.Card(110)),
-                    new(115.0002, 0, KeyframeVisuals.Card(115)),
-                    .. Keyframes(117, 125, 2),
-                ]),
-                [],
-                [],
-                null);
+            data.Add(Pages(cardsThenRoll), [(42, 79.9996)], [], (0, 80));
 
             // Pages without a visual are invisible to the card finder: they do not join two card spans
             // 24 s apart, which break at the run gap, and the later span is the run.
             data.Add(
-                Pages([.. Keyframes(0, 20, 2, (0, 20, 0, KeyframeVisuals.Card)), .. Keyframes(22, 42, 2, (22, 42, 0, _ => null)), .. Keyframes(44, 64, 2, (44, 64, 0, KeyframeVisuals.Card))]),
+                Pages([.. Keyframes(0, 20, 2, (0, 20, 0, KeyframeVisuals.Card)), .. Keyframes(22, 42, 2, (22, 42, 0, null)), .. Keyframes(44, 64, 2, (44, 64, 0, KeyframeVisuals.Card))]),
                 [],
                 [],
                 (44, 64));
@@ -1751,7 +1711,7 @@ public class TestBlackFrames
             // Dark detailed keyframes at 89 percent are black at the minimum of 85, but their luma spreads
             // too wide for a card. With no accepted scene the visuals alone decide, so they are content
             // and stay in the density ratio: 13 cards among 31 keyframes fail the floor.
-            data.Add(Pages(Times(0, 60, 2).Select(t => t % 10 is 0 or 4 ? new Keyframe(t, 0, KeyframeVisuals.Card(t)) : new Keyframe(t, 89, KeyframeVisuals.Dark(t)))), [], [], null);
+            data.Add(Pages(Times(0, 60, 2).Select(t => t % 10 is 0 or 4 ? new Keyframe(t, 0, KeyframeVisuals.Card) : new Keyframe(t, 89, KeyframeVisuals.Dark))), [], [], null);
 
             // One-keyframe black flashes before an interval-confirmed roll: the accepted black scene
             // starts at the roll, so the flashes are content and the run starts there too.
@@ -1768,7 +1728,7 @@ public class TestBlackFrames
 
             // Black page, grey card, busy frame repeating, with no black-frame candidate: the visuals
             // alone decide, as the old fallback did, and two cards in three keep the run.
-            data.Add(Pages(Times(0, 60, 2).Select(t => t % 6 == 0 ? new Keyframe(t, 100, KeyframeVisuals.Black(t)) : new Keyframe(t, 0, t % 6 == 2 ? KeyframeVisuals.Card(t) : KeyframeVisuals.Content(t)))), [], [], (0, 60));
+            data.Add(Pages(Times(0, 60, 2).Select(t => t % 6 == 0 ? new Keyframe(t, 100, KeyframeVisuals.Black) : new Keyframe(t, 0, t % 6 == 2 ? KeyframeVisuals.Card : KeyframeVisuals.Content))), [], [], (0, 60));
 
             // Red lettering on black raises the mean saturation, not the background's: a card run
             // through the no-scene fallback like white lettering would be.
@@ -1867,15 +1827,16 @@ public class TestBlackFrames
     // ── Helpers ─────────────────────────────────────────────────────────
 
     /// <summary>
-    /// Parses a raw FFmpeg blackframe filter output file into a list of <see cref="BlackFrame"/> records.
-    /// Delegates to the production <see cref="FFmpegOutputParser.ParseBlackFrame"/> parser to avoid
-    /// regex/format drift between tests and implementation.
+    /// Parses a raw FFmpeg blackframe filter output file, logged by a blackframe@TOKEN instance, into
+    /// a list of <see cref="BlackFrame"/> records. Delegates to the production
+    /// <see cref="FFmpegOutputParser.ParseBlackFrames"/> parser to avoid regex/format drift between
+    /// tests and implementation.
     /// </summary>
     private static List<BlackFrame> ParseFingerprintFile(string filename)
     {
         var path = Path.Combine("..", "..", "..", "fingerprints", filename);
         var raw = File.ReadAllText(path);
-        return [.. FFmpegOutputParser.ParseBlackFrames(raw)];
+        return [.. FFmpegOutputParser.ParseBlackFrames(raw, new FilterInstance("blackframe@TOKEN"))];
     }
 
     /// <summary>
@@ -1915,7 +1876,7 @@ public class TestBlackFrames
         => [.. (await analyzer.DetectCreditsAsync(episode, CancellationToken.None)).Select(c => (c.Source, c.Segment.Start, c.Segment.End))];
 
     private static KeyframeScan ScanOf(IEnumerable<BlackFrame> frames, int blackMinimum, int sceneChange)
-        => new([.. frames.Select(frame => new KeyframePage(frame, null))], blackMinimum, sceneChange);
+        => new([.. frames.Select(frame => new KeyframePage(frame.Time, frame.Percentage, null))], blackMinimum, sceneChange);
 
     private static Func<IReadOnlyList<CreditScene>, Task<BlackInterval[]>> ProbeFinding(params BlackInterval[] intervals)
         => _ => Task.FromResult(intervals);
@@ -1946,7 +1907,7 @@ public class TestBlackFrames
     private static StubFFmpegService KeyframeScan(
         IEnumerable<Keyframe> keyframes,
         BlackInterval[]? intervals = null,
-        Func<QueuedEpisode, TimeRange, KeyframeVisual[]?>? cutWindows = null)
+        Func<QueuedEpisode, TimeRange, CutFrame[]?>? cutWindows = null)
     {
         var pages = Pages(keyframes);
         return new()
@@ -1970,9 +1931,9 @@ public class TestBlackFrames
     /// its end, each differing from the frame before by 1, except the first, which differs by 0, and
     /// the frame <paramref name="cutFrame"/> after the start, which carries the cut's difference of 40.
     /// </summary>
-    private static KeyframeVisual[] CutFrames(TimeRange window, int cutFrame)
+    private static CutFrame[] CutFrames(TimeRange window, int cutFrame)
         => [.. Enumerable.Range(0, (int)Math.Round(window.Duration * 24)).Select(i =>
-            KeyframeVisuals.Black(window.Start + (i / 24.0)) with { FrameDifference = i == 0 ? 0 : i == cutFrame ? 40 : 1 })];
+            new CutFrame(window.Start + (i / 24.0), KeyframeVisuals.Black with { FrameDifference = i == 0 ? 0 : i == cutFrame ? 40 : 1 }))];
 
     /// <summary>
     /// Keyframes 0.5 s apart from 0 to 49.5: dark shots at 30 percent black, with a black roll page at
@@ -1980,7 +1941,7 @@ public class TestBlackFrames
     /// after it.
     /// </summary>
     private static IEnumerable<Keyframe> DarkSceneWithBlackPages(int every, int percentage)
-        => Times(0, 49.5, 0.5).Select((t, i) => i % every == 0 ? new Keyframe(t, percentage, KeyframeVisuals.Black(t)) : new Keyframe(t, 30, KeyframeVisuals.Dark(t)));
+        => Times(0, 49.5, 0.5).Select((t, i) => i % every == 0 ? new Keyframe(t, percentage, KeyframeVisuals.Black) : new Keyframe(t, 30, KeyframeVisuals.Dark));
 
     /// <summary>
     /// Keyframes ten seconds apart from 0 to 120: content, then a roll that is black from the page at
@@ -1995,37 +1956,21 @@ public class TestBlackFrames
         var pageVisual = page switch
         {
             "no visual" => null,
-            "dim" => KeyframeVisuals.DarkGrey(pageTime),
-            "content" => KeyframeVisuals.Content(pageTime),
-            _ => KeyframeVisuals.Black(pageTime),
+            "dim" => KeyframeVisuals.DarkGrey,
+            "content" => KeyframeVisuals.Content,
+            _ => KeyframeVisuals.Black,
         };
         var rollStart = page == "content" ? 50 : pageTime;
         double[] times = [0, 10, 20, 30, pageTime, 50, 60, 70, 80, 90, 100, 110, 120];
         return KeyframeScan(
             times.Select(time => new Keyframe(time, time >= rollStart && time <= 80 ? 100 : 0, time == pageTime ? pageVisual : time switch
             {
-                < 40 => KeyframeVisuals.Content(time),
-                50 when page == "level before dim" => KeyframeVisuals.DarkGrey(time),
-                <= 80 => KeyframeVisuals.Black(time),
-                _ => KeyframeVisuals.Card(time),
+                < 40 => KeyframeVisuals.Content,
+                50 when page == "level before dim" => KeyframeVisuals.DarkGrey,
+                <= 80 => KeyframeVisuals.Black,
+                _ => KeyframeVisuals.Card,
             })),
             intervals: [new BlackInterval(40, 80)]);
-    }
-
-    private static KeyframeVisual[] CreateCardCreditVisuals(double cardStart, double cardEnd, double cardSaturation)
-    {
-        var visuals = new List<KeyframeVisual>();
-        for (var time = 0.0; time < cardStart; time += 2)
-        {
-            visuals.Add(KeyframeVisuals.Content(time));
-        }
-
-        for (var time = cardStart; time <= cardEnd; time += 2)
-        {
-            visuals.Add(KeyframeVisuals.Card(time, cardSaturation));
-        }
-
-        return [.. visuals];
     }
 
     private static IEnumerable<double> Times(double from, double to, double step)
@@ -2036,11 +1981,9 @@ public class TestBlackFrames
         }
     }
 
-    private static IEnumerable<KeyframeVisual> Cards(double from, double to, double step)
-        => Times(from, to, step).Select(t => KeyframeVisuals.Card(t));
+    private static IEnumerable<Keyframe> Cards(double from, double to, double step) => NotBlack(from, to, step, KeyframeVisuals.Card);
 
-    private static IEnumerable<KeyframeVisual> Busy(double from, double to, double step)
-        => Times(from, to, step).Select(t => KeyframeVisuals.Content(t));
+    private static IEnumerable<Keyframe> Busy(double from, double to, double step) => NotBlack(from, to, step, KeyframeVisuals.Content);
 
     /// <summary>
     /// Keyframes every <paramref name="step"/> seconds from 0 to <paramref name="end"/>, none of them
@@ -2048,16 +1991,17 @@ public class TestBlackFrames
     /// rest busy content.
     /// </summary>
     private static Keyframe[] Seq(double end, double step, params (double From, double To)[] cards)
-        => NotBlack(Times(0, end, step).Select(t => cards.Any(c => t >= c.From - 1e-9 && t <= c.To + 1e-9)
-            ? KeyframeVisuals.Card(t)
-            : KeyframeVisuals.Content(t)));
+        => [.. Times(0, end, step).Select(t => new Keyframe(t, 0, cards.Any(c => t >= c.From - 1e-9 && t <= c.To + 1e-9)
+            ? KeyframeVisuals.Card
+            : KeyframeVisuals.Content))];
 
     /// <summary>
-    /// Keyframes for <paramref name="visuals"/> that the blackframe filter does not count as black
-    /// at all, as cards and busy content are not.
+    /// Keyframes every <paramref name="step"/> seconds from <paramref name="from"/> to
+    /// <paramref name="to"/> with <paramref name="visual"/>, which the blackframe filter does not
+    /// count as black at all, as cards and busy content are not.
     /// </summary>
-    private static Keyframe[] NotBlack(IEnumerable<KeyframeVisual> visuals)
-        => [.. visuals.Select(visual => new Keyframe(visual.Time, 0, visual))];
+    private static IEnumerable<Keyframe> NotBlack(double from, double to, double step, KeyframeVisual visual)
+        => Times(from, to, step).Select(t => new Keyframe(t, 0, visual));
 
     /// <summary>
     /// Keyframes 0.5s apart with a per-index black percentage.

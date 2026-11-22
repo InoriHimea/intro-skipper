@@ -18,29 +18,29 @@ internal static class BlackFrameFixtures
     /// Keyframes every <paramref name="step"/> seconds from <paramref name="from"/> to
     /// <paramref name="to"/>. A keyframe inside one of the <paramref name="spans"/>, the first that
     /// holds it, takes that span's black percentage and visual; any other is busy content, not
-    /// black. A span's visual may be <see langword="null"/> for a page the visuals decode did not report.
+    /// black. A span's visual may be <see langword="null"/> for a page with no visual.
     /// </summary>
     /// <param name="from">The first keyframe time, relative to the scanned window.</param>
     /// <param name="to">The last keyframe time, inclusive.</param>
     /// <param name="step">The keyframe spacing.</param>
     /// <param name="spans">Inclusive time spans with the black percentage and the visual of their keyframes.</param>
     /// <returns>The keyframes, in time order.</returns>
-    internal static Keyframe[] Keyframes(double from, double to, double step, params (double From, double To, int Percentage, Func<double, KeyframeVisual?> Visual)[] spans)
+    internal static Keyframe[] Keyframes(double from, double to, double step, params (double From, double To, int Percentage, KeyframeVisual? Visual)[] spans)
         => [.. Enumerable.Range(0, (int)Math.Round((to - from) / step) + 1).Select(i =>
         {
             var time = from + (i * step);
             var index = Array.FindIndex(spans, span => time >= span.From - 1e-9 && time <= span.To + 1e-9);
-            return index < 0 ? new Keyframe(time, 0, KeyframeVisuals.Content(time)) : new Keyframe(time, spans[index].Percentage, spans[index].Visual(time));
+            return index < 0 ? new Keyframe(time, 0, KeyframeVisuals.Content) : new Keyframe(time, spans[index].Percentage, spans[index].Visual);
         })];
 
     /// <summary>
     /// The pages the keyframe scan reports for <paramref name="keyframes"/>: one per keyframe, its
-    /// black-frame row numbered by index and its visual, when it has one.
+    /// black-frame evidence numbered by index and its visual, when it has one.
     /// </summary>
     /// <param name="keyframes">The keyframes, in time order.</param>
     /// <returns>The pages.</returns>
     internal static KeyframePage[] Pages(IEnumerable<Keyframe> keyframes)
-        => [.. keyframes.Select((keyframe, frame) => new KeyframePage(new BlackFrame(keyframe.Percentage, keyframe.Time, frame), keyframe.Visual))];
+        => [.. keyframes.Select(keyframe => new KeyframePage(keyframe.Time, keyframe.Percentage, keyframe.Visual))];
 
     /// <summary>
     /// Creates a dense run of keyframes at the given black percentage.
@@ -78,12 +78,10 @@ internal static class BlackFrameFixtures
     ];
 
     /// <summary>
-    /// One keyframe of the keyframe scan: its black-frame row's time and percentage, and its
-    /// visual. The visual carries its own time, which only the service's join reads, so a fixture that
-    /// puts the two clocks apart pins that the analyzer reads the black-frame time.
+    /// One keyframe of the keyframe scan: its time, black percentage and visual.
     /// </summary>
-    /// <param name="Time">The black-frame row's time.</param>
-    /// <param name="Percentage">The black-frame row's percentage.</param>
-    /// <param name="Visual">The keyframe's visual, or <see langword="null"/> for a page the visuals decode did not report.</param>
+    /// <param name="Time">The keyframe's time.</param>
+    /// <param name="Percentage">The keyframe's black percentage.</param>
+    /// <param name="Visual">The keyframe's visual, or <see langword="null"/> for a page with no visual.</param>
     internal readonly record struct Keyframe(double Time, int Percentage, KeyframeVisual? Visual);
 }

@@ -4,6 +4,7 @@
 
 using System.Security.Cryptography;
 using System.Text;
+using IntroSkipper.Analyzers;
 using IntroSkipper.Configuration;
 using IntroSkipper.Data;
 
@@ -35,6 +36,15 @@ internal static class ConfigHasher
     // conventional part of a compound hash, outside the subtitle settings.
     private const string PreviewAnchorToken = "|previewAnchor=lastCredits";
 
+    // Preview derivation now caps its minimum at the shortest eligible post-credits tail. The
+    // setting already carries the raw configured minimum; this token invalidates old NoSegments
+    // records once so newly eligible tails under the cap can be derived.
+    private const string PreviewDerivedMinimumToken = "|previewDerivedMin=cap5";
+
+    // A season that derives previews extends credits to the window end according to the effective
+    // derived-preview minimum, capped at AnimePreviewDeriver.ShortestTailSeconds. Shared-audio
+    // voting also uses that minimum and MaximumPreviewDuration. Keep these inputs in the Credits
+    // hash even when chapter policy hashing omits them, such as with chapter enhancement enabled.
     // Subtitle recaps end at a chapter or a black run of at least 2 s, no longer at the intro
     // start (SubtitleAnalyzer). It sits in the subtitle part of the Recap hash, so seasons with
     // subtitle recap detection on rerun subtitle analysis alone. Bump it when that rule changes.
@@ -123,7 +133,7 @@ internal static class ConfigHasher
                 $"analysis|v1|mode={mode}|action={action}|prefer={config.PreferChromaprint}|chap={config.ChapterAnalyzerIntroductionPattern}|fullchap={config.FullLengthChapters}|sbchap={config.EnableSponsorBlockChapterDetection}",
                 $"|pct={analysisPercent}|limit={analysisLengthLimit}|min={config.MinimumIntroDuration}|max={config.MaximumIntroDuration}",
                 $"|fpbits={config.MaximumFingerprintPointDifferences}|skip={config.MaximumTimeSkip}|shift={config.InvertedIndexShift}|chromaprint={ffmpegValid}{ChromaprintStreamToken(config)}{SettledConsensusToken(config, mode, action, ffmpegValid)}",
-                $"{AdjustmentHash(config)}{ChapterSourceToken(source)}{CommunityToken(config, communityFallback ?? config.EnableCommunityFallback)}"),
+                $"{AdjustmentHash(config, mode)}{ChapterSourceToken(source)}{CommunityToken(config, communityFallback ?? config.EnableCommunityFallback)}"),
 
             // Frozen at v3 on purpose: the credits pass replaced the first-wins chain
             // without a bump, because a bump re-fingerprints and re-scans every season a chapter
@@ -138,8 +148,8 @@ internal static class ConfigHasher
                 $"|min={config.MinimumCreditsDuration}|bfmin={config.BlackFrameMinimumPercentage}|bfthr={config.BlackFrameThreshold}|bfchap={!config.UseLegacyBlackFrameAnalyzer || config.UseChapterMarkersBlackFrame}",
                 $"|bflegacy={config.UseLegacyBlackFrameAnalyzer}|bfrefine={config.RefineCreditsBoundary}|bfVersion=3{CreditsNonBlackToken(config)}",
                 $"|fpbits={config.MaximumFingerprintPointDifferences}|skip={config.MaximumTimeSkip}|shift={config.InvertedIndexShift}|chromaprint={ffmpegValid}{ChromaprintStreamToken(config)}{SettledConsensusToken(config, mode, action, ffmpegValid)}",
-                $"|animePreview={previewFromCreditsEnd}{ChapterEnhancementToken(config, action)}{PreviewChapterToken(config, action)}",
-                $"{AdjustmentHash(config)}{ChapterSourceToken(source)}{CommunityToken(config, communityFallback ?? config.EnableCommunityFallback)}"),
+                $"|animePreview={previewFromCreditsEnd}{(previewFromCreditsEnd ? PreviewCreditsToken(config) : string.Empty)}{ChapterEnhancementToken(config, action)}{PreviewChapterToken(config, action)}",
+                $"{AdjustmentHash(config, mode)}{ChapterSourceToken(source)}{CommunityToken(config, communityFallback ?? config.EnableCommunityFallback)}"),
 
             AnalysisMode.Recap => Invariant(
                 $"analysis|v3|mode={mode}|action={action}|prefer={config.PreferChromaprint}|chap={config.ChapterAnalyzerRecapPattern}|fullchap={config.FullLengthChapters}|sbchap={config.EnableSponsorBlockChapterDetection}|min={config.MinimumRecapDuration}|max={config.MaximumRecapDuration}{(includeSubtitleSettingsForMode ? ChapterBeforeSubtitlePrecedenceToken : string.Empty)}",
@@ -147,16 +157,16 @@ internal static class ConfigHasher
                 $"|recapBlackFrames={config.DetectRecapUsingBlackFrames}|bfmin={config.BlackFrameMinimumPercentage}|bfthr={config.BlackFrameThreshold}{RecapColdOpenToken(config)}{RecapStingEndToken}",
                 $"{(includeSubtitleSettingsForMode ? $"|subtitle=True|subtitlePattern={config.SubtitleRecapPattern}|subtitleLanguages={SubtitleLanguageSelection.Parse(config.SubtitleLanguages).Normalized}{SubtitleRecapEndToken}" : string.Empty)}",
                 $"|pct={analysisPercent}|limit={analysisLengthLimit}|fpbits={config.MaximumFingerprintPointDifferences}|skip={config.MaximumTimeSkip}|shift={config.InvertedIndexShift}|chromaprint={ffmpegValid}{ChromaprintStreamToken(config)}",
-                $"{AdjustmentHash(config)}{ChapterSourceToken(source)}"),
+                $"{AdjustmentHash(config, mode)}{ChapterSourceToken(source)}"),
 
             AnalysisMode.Preview => Invariant(
                 $"analysis|v2|mode={mode}|action={action}|chap={config.ChapterAnalyzerPreviewPattern}|fullchap={config.FullLengthChapters}|sbchap={config.EnableSponsorBlockChapterDetection}|min={config.MinimumPreviewDuration}|max={config.MaximumPreviewDuration}{(includeSubtitleSettingsForMode ? ChapterBeforeSubtitlePrecedenceToken : string.Empty)}",
-                $"|animePreview={previewFromCreditsEnd}{(previewFromCreditsEnd ? PreviewAnchorToken : string.Empty)}{(includeSubtitleSettingsForMode ? $"|subtitle=True|subtitlePattern={config.SubtitlePreviewPattern}|subtitleLanguages={SubtitleLanguageSelection.Parse(config.SubtitleLanguages).Normalized}" : string.Empty)}",
-                $"{AdjustmentHash(config)}{ChapterSourceToken(source)}"),
+                $"|animePreview={previewFromCreditsEnd}{(previewFromCreditsEnd ? PreviewAnchorToken + PreviewDerivedMinimumToken : string.Empty)}{(includeSubtitleSettingsForMode ? $"|subtitle=True|subtitlePattern={config.SubtitlePreviewPattern}|subtitleLanguages={SubtitleLanguageSelection.Parse(config.SubtitleLanguages).Normalized}" : string.Empty)}",
+                $"{AdjustmentHash(config, mode)}{ChapterSourceToken(source)}"),
 
             AnalysisMode.Commercial => Invariant(
                 $"analysis|v1|mode={mode}|action={action}|chap={config.ChapterAnalyzerCommercialPattern}|fullchap={config.FullLengthChapters}|sbchap={config.EnableSponsorBlockChapterDetection}|min={config.MinimumCommercialDuration}|max={config.MaximumCommercialDuration}",
-                $"{AdjustmentHash(config)}{ChapterSourceToken(source)}"),
+                $"{AdjustmentHash(config, mode)}{ChapterSourceToken(source)}"),
 
             _ => throw new ArgumentOutOfRangeException(nameof(mode), mode, null)
         };
@@ -267,9 +277,10 @@ internal static class ConfigHasher
             // v2: VP9 keyframe listings select packet keyframes.
             CacheEntryType.Keyframe => $"cache|v2|{type}",
 
-            // Credits v4: VP9 visual scans select packet keyframes. Credits v5: visuals carry the
-            // frame difference and no longer the darkest-tenth saturation.
-            CacheEntryType.KeyframeVisual => $"cache|v{(mode == AnalysisMode.Credits ? 5 : 3)}|{type}|{mode}",
+            // Every fact of a page is cached, and the threshold decides its black percentage. v2: the
+            // page holds its time and black percentage directly; a v1 row would read back as zeros.
+            CacheEntryType.KeyframePage => Invariant(
+                $"cache|v2|{type}|{mode}|threshold={config.BlackFrameThreshold}"),
 
             // The rule's thresholds are constants: bump the token when they change.
             CacheEntryType.Cut => $"cache|v1|{type}",
@@ -382,15 +393,15 @@ internal static class ConfigHasher
     private static string ChapterEnhancementToken(PluginConfiguration config, AnalyzerAction action)
         => config.EnhanceChapterCredits && action is not AnalyzerAction.BlackFrame ? "|enhanceChapterCredits=True" : string.Empty;
 
-    // Without enhancement a credits chapter settles its episode only when no story runs to the
-    // next preview chapter, so the preview chapter settings can change Credits. Present only when
-    // they differ from the defaults, the pre-10.11.22 pattern included, so default installs keep
-    // their hash. The two default patterns differ only on colon-delimited end labels such as
-    // "Preview: End". Full-length chapters replace the duration limits for every mode, so under
-    // them the limits count as their defaults.
+    // Preview chapters affect Credits when enhancement is off, because they determine whether
+    // story follows a credits chapter, and with enhancement on, because their ranges keep card
+    // candidates from consuming preview cards. A BlackFrame action does not consult chapters.
+    // Present only when these settings differ from defaults, the pre-10.11.22 pattern included,
+    // so default installs keep their hash. Full-length chapters replace duration limits for every
+    // mode, so under them the limits count as their defaults.
     private static string PreviewChapterToken(PluginConfiguration config, AnalyzerAction action)
     {
-        if (config.EnhanceChapterCredits || action is AnalyzerAction.BlackFrame)
+        if (action is AnalyzerAction.BlackFrame)
         {
             return string.Empty;
         }
@@ -404,6 +415,10 @@ internal static class ConfigHasher
             ? FormattableString.Invariant($"|previewChap={config.ChapterAnalyzerPreviewPattern}|previewMin={minimum}|previewMax={maximum}")
             : string.Empty;
     }
+
+    private static string PreviewCreditsToken(PluginConfiguration config)
+        => FormattableString.Invariant(
+            $"|previewTail={AnimePreviewDeriver.CreditsWindowEndReach(config.MinimumCreditsDuration, config.MinimumPreviewDuration)}|previewVote=majority:min={AnimePreviewDeriver.MinimumDuration(config.MinimumPreviewDuration)}:max={config.MaximumPreviewDuration}");
 
     private static string ChapterSourceToken(ChapterSource source)
         => source == ChapterSource.Embedded ? EmbeddedChapterSourceToken : string.Empty;
@@ -438,12 +453,25 @@ internal static class ConfigHasher
     private static string BlackFrameAmountToken(AnalysisMode mode)
         => mode == AnalysisMode.Recap ? "|amount=0" : string.Empty;
 
-    private static string AdjustmentHash(PluginConfiguration config)
-        => Invariant(
+    private static string AdjustmentHash(PluginConfiguration config, AnalysisMode mode)
+    {
+        bool isIntroduction = mode == AnalysisMode.Introduction;
+        bool isCredits = mode == AnalysisMode.Credits;
+        double startOffset = isIntroduction ? config.IntroStartOffset : isCredits ? config.CreditsStartOffset : 0;
+        double endOffset = isIntroduction ? config.IntroEndOffset : isCredits ? config.CreditsEndOffset : 0;
+        bool includeStartOffsetWhenSnapping = isIntroduction && config.IncludeIntroStartOffsetWhenSnapping;
+        string creditsStartOffsetSemanticsToken = isCredits && startOffset != 0
+            ? "|creditsStartOnSnap=always-v1"
+            : string.Empty;
+        string includeEndOffsetWhenSnapping = isCredits && endOffset != 0 && config.IncludeCreditsEndOffsetWhenSnapping
+            ? "|includeEndOffsetWhenSnapping=true"
+            : string.Empty;
+        return Invariant(
             $"|chapAdjust={config.AdjustIntroBasedOnChapters}|silence={config.AdjustIntroBasedOnSilence}|keyframe={config.SnapToKeyframe}",
             $"|endSnap={config.EndSnapThreshold}|winIn={config.AdjustWindowInward}|winOut={config.AdjustWindowOutward}",
             $"|noise={config.SilenceDetectionMaximumNoise}|silDur={config.SilenceDetectionMinimumDuration}",
-            $"|startOffset={config.IntroStartOffset}|includeStartOffsetWhenSnapping={config.IncludeIntroStartOffsetWhenSnapping}|endOffset={config.IntroEndOffset}");
+            $"|startOffset={startOffset}|includeStartOffsetWhenSnapping={includeStartOffsetWhenSnapping}|endOffset={endOffset}{creditsStartOffsetSemanticsToken}{includeEndOffsetWhenSnapping}");
+    }
 
     private static string Invariant(params FormattableString[] parts)
         => string.Concat(parts.Select(FormattableString.Invariant));

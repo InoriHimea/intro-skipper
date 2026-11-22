@@ -327,9 +327,8 @@ public class PluginConfiguration : BasePluginConfiguration
     public bool SkipFirstEpisodeAnime { get; set; } = false;
 
     /// <summary>
-    /// Gets or sets a value indicating whether content after credits should be set as a preview for anime episodes.
-    /// When enabled, a Preview segment is created for anime from the end of the last credits block through
-    /// the end of the episode. Individual seasons can override this setting.
+    /// Gets or sets a value indicating whether the legacy global preview choice is enabled. It is
+    /// retained for upgrade migration and legacy hash recognition.
     /// </summary>
     public bool AnimePreviewFromCreditsEnd { get; set; } = false;
 
@@ -601,9 +600,25 @@ public class PluginConfiguration : BasePluginConfiguration
     public int IntroEndOffset { get; set; }
 
     /// <summary>
+    /// Gets or sets the amount of credits to play before resuming (in seconds).
+    /// </summary>
+    public double CreditsEndOffset { get; set; }
+
+    /// <summary>
+    /// Gets or sets a value indicating whether to apply <see cref="CreditsEndOffset" /> when the
+    /// credits end is snapped to the end of the episode.
+    /// </summary>
+    public bool IncludeCreditsEndOffsetWhenSnapping { get; set; }
+
+    /// <summary>
     /// Gets or sets the amount of intro at start to play (in seconds).
     /// </summary>
     public int IntroStartOffset { get; set; }
+
+    /// <summary>
+    /// Gets or sets the amount of credits at start to play (in seconds).
+    /// </summary>
+    public double CreditsStartOffset { get; set; }
 
     /// <summary>
     /// Gets or sets a value indicating whether to apply <see cref="IntroStartOffset" /> when the
@@ -690,6 +705,16 @@ public class PluginConfiguration : BasePluginConfiguration
     /// Gets or sets the relative priority for analysis ffmpeg processes.
     /// </summary>
     public ProcessPriorityClass ProcessPriority { get; set; } = ProcessPriorityClass.BelowNormal;
+
+    /// <summary>
+    /// Gets or sets a value indicating whether the keyframe scan, the recap black-frame scan and
+    /// the black interval probe decode H.264 and HEVC on the hardware Jellyfin's playback uses, in
+    /// the pixel formats measured to decode the same there (<c>FFmpegService.DecodesOnHardware</c>).
+    /// They follow Jellyfin's hardware settings and stay in software while a video transcode runs.
+    /// Not hashed: in those formats VAAPI and D3D11VA matched software's pages and frames, apart from the differences docs/credits.md accepts.
+    /// QSV on Windows and VideoToolbox have not been compared with software, so their cached rows share software's config hash on the untested assumption that they match too.
+    /// </summary>
+    public bool UseHardwareDecoding { get; set; }
 
     /// <summary>
     /// Gets or sets a value indicating whether to use the File Transformation plugin if available.

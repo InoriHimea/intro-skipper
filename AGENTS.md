@@ -37,7 +37,7 @@ Run .NET commands from the repo root. Ignore `IntroSkipper/IntroSkipper.sln`; it
 
 - The plugin csproj's `WebBuild` target runs `pnpm install --frozen-lockfile && pnpm build` in `web/` before every compile. Pass `-p:SkipWebBuild=true` when only touching C#; it still builds the frontend when its gitignored outputs, introskipper.js and introskipper.css in `IntroSkipper/Configuration/`, are missing, as in a fresh worktree.
 - `TreatWarningsAsErrors` with StyleCop and all analyzers enabled (`AnalysisMode=AllEnabledByDefault`). Any new warning fails the build.
-- Tests need jellyfin-ffmpeg with chromaprint. On Windows, `WindowsFfmpegTestBootstrap` downloads a portable build each time the test host starts and extracts `ffmpeg.exe` and `ffprobe.exe` to `IntroSkipper.Tests/bin/Debug/net10.0/_ffmpeg/extract/`; use those for experiments. Linux/CI installs the `jellyfin-ffmpeg8` package.
+- Tests need jellyfin-ffmpeg with chromaprint. On Windows, `WindowsFfmpegTestBootstrap` downloads the pinned portable build once per release into IntroSkipper.Tests/ffmpeg/<release> under %LOCALAPPDATA% and reuses it; use the `ffmpeg.exe` and `ffprobe.exe` there for experiments. Linux/CI installs the `jellyfin-ffmpeg8` package.
 - Tests and CI pin jellyfin-ffmpeg 8.1.3, matching Jellyfin 12 servers, but the README still accepts 7.1.3 or newer. Check a change to ffmpeg arguments or output parsing on both.
 - `web/` is plain TypeScript plus Vite, no framework. `pnpm build` runs `tsc` first, so a type error in `web/` fails the plugin build unless you pass `SkipWebBuild` once its outputs exist.
 </important>
@@ -49,7 +49,7 @@ Put a test in the folder matching the plugin code it covers. Reuse the shared se
 - `TempSegmentDb`, `TempCacheDb` (temp-file segment and detection-cache databases, deleted on dispose), `DatabaseTestHelpers` (facades over temp-file SQLite), `TempJellyfinDb` (real `JellyfinDbContext` over temp SQLite)
 - `SegmentChangeHarness` (production segment-change composition over a temp DB and a fake store), `SegmentSeeding` (seeds user state through `ApplyChangeAsync`), `EntrypointTestHelpers` (entrypoint over fresh databases)
 - `FakeJellyfinSegmentStore` (records calls, can throw or park), `FakeMirrorPolicy` (settable policy with a toggle event), `StubFFmpegService` (counting `IFFmpegService` with per-member hooks), `ChapterManagerStub` (fixed chapter list), `JellyfinItems` (library items shaped for the season resolver, `WithParents` adds the series and seasons the episodes name)
-- `FfmpegTestHelpers` (real ffmpeg over the fixture media), `LegacySchemaFixtures` (pre-v2 rows for importer tests)
+- `FfmpegTestHelpers` (real ffmpeg over the fixture media), `KeyframeFilterOracle` (pages from ffmpeg's blackframe and signalstats filters, for pinning the C# page facts), `LegacySchemaFixtures` (pre-v2 rows for importer tests)
 
 Test parallelization is disabled assembly-wide, so tests may share `Plugin.Instance`.
 </important>

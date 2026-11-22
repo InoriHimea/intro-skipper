@@ -6,11 +6,11 @@
 
 | 项目 | 值 |
 | --- | --- |
-| 上游基线 | `12.0` 分支（包含 `12.0/v12.0.6.0`） |
-| 上游提交 | `223a0860535f24744ee164bd3797976b6aa3d685` |
-| 补丁分支 | `inori/community-fallback`（含片尾保留、社区补充与本补丁） |
-| 程序集 / 文件版本 | `12.0.6.0`，保持原插件身份 |
-| 补丁发行标签 | `12.0/v12.0.6.0-inori-introffset.1`（GitHub Actions 构建，未签名，源提交 `d283b6b`） |
+| 上游基线 | `12.0` 分支（包含 `12.0/v12.0.7.0`） |
+| 上游提交 | `6ce58f3cb20930aa4b5ae01d35177f6b49463f37` |
+| 补丁分支 | `inori/outro-tail-5s`（含片尾保留、社区补充与本补丁） |
+| 程序集 / 文件版本 | `12.0.7.0`，保持原插件身份 |
+| 补丁发行标签 | `12.0/v12.0.7.0-inori-introffset.1`（GitHub Actions 构建，未签名） |
 | 新增生产文件 | `Filters/PlaybackIntroOffsetFilter.cs`、`Filters/PlaybackIntroOffsets.cs`、`Filters/PlaybackSegmentsAction.cs` |
 | 修改生产文件 | `Filters/PlaybackFiltersConvention.cs`（原 `PlaybackOutroTailFilterConvention.cs` 更名并同时挂载两个过滤器）、`Filters/PlaybackOutroTailFilter.cs`、`Manager/IJellyfinSegmentStore.cs`、`Manager/JellyfinSegmentStore.cs`、`PluginServiceRegistrator.cs` |
 

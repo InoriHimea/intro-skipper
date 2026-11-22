@@ -69,16 +69,18 @@ public interface IFFmpegService
     /// frame difference.
     /// </summary>
     /// <remarks>
-    /// One keyframe decode writes two cache rows, the black-frame row and the visuals row. This reads
-    /// each row, or decodes it on a miss, and pairs them into pages, so no caller joins them. A
-    /// page's time is its black-frame time. A page has no visual when it lies past the credits
-    /// window, when no visual lies within 10 ms of its row, or when the ffmpeg check found the
-    /// signalstats filter missing.
+    /// One ffmpeg pipes every keyframe here as raw yuv420p and the plugin measures it (<see cref="PageFacts"/>).
+    /// The pages are cached as one row, keyed by the credits start. It holds every keyframe to the end of
+    /// the file and is clipped at this read, so a page past the credits window has no visual. A software scan whose
+    /// ffmpeg exits nonzero keeps and caches the pages it read; a hardware run that does is discarded
+    /// and rerun in software.
     /// </remarks>
     /// <param name="episode">Media file to analyze.</param>
-    /// <param name="config">The configuration the scan runs under; its black-frame threshold drives the scan and both cache rows are hashed under it.</param>
+    /// <param name="config">The configuration the scan runs under; its black-frame threshold is the pixel threshold and the row is hashed under it.</param>
     /// <param name="cancellationToken">Token used to cancel the FFmpeg process.</param>
-    /// <returns>A task that returns one page per keyframe, in time order, relative to the credits fingerprint start.</returns>
+    /// <returns>A task that returns one page per keyframe, in the order ffmpeg decoded them, relative to the credits fingerprint start.</returns>
+    /// <exception cref="InvalidDataException">The pipe broke its protocol: ffmpeg was killed and nothing was cached.</exception>
+    /// <exception cref="TimeoutException">ffmpeg did not exit within the scan timeout; nothing was cached.</exception>
     Task<KeyframePage[]> ScanKeyframesAsync(QueuedEpisode episode, PluginConfiguration config, CancellationToken cancellationToken = default);
 
     /// <summary>
@@ -89,7 +91,7 @@ public interface IFFmpegService
     /// <param name="minimum">Minimum percentage of a frame that must be black for it to count as black (blackdetect pic_th); tie this to the keyframe density threshold so both definitions of "black" agree.</param>
     /// <param name="config">The configuration the scan runs under; its black-frame threshold is the pixel threshold and its cache row is hashed under it.</param>
     /// <param name="cancellationToken">Token used to cancel the FFmpeg process.</param>
-    /// <returns>A task that returns continuous black intervals, in absolute media seconds.</returns>
+    /// <returns>A task that returns continuous black intervals, in absolute media seconds, each clipped to <paramref name="range"/>.</returns>
     Task<BlackInterval[]> DetectBlackIntervalsAsync(QueuedEpisode episode, TimeRange range, int minimum, PluginConfiguration config, CancellationToken cancellationToken = default);
 
     /// <summary>
@@ -97,7 +99,7 @@ public interface IFFmpegService
     /// </summary>
     /// <remarks>
     /// Not cached: the caller caches the start it derives. The frames are decoded at source
-    /// resolution with the keyframe scan's filters, so each frame's
+    /// resolution through signalstats on <c>format=yuv420p</c>, so each frame's
     /// <see cref="KeyframeVisual.FrameDifference"/> compares directly with a page's: both are YDIF of
     /// the same 8-bit yuv420p frames at the same resolution. The first frame's difference is 0,
     /// since nothing was decoded before it. Each output stream is capped at 64 MiB.
@@ -105,8 +107,8 @@ public interface IFFmpegService
     /// <param name="episode">Media file to decode.</param>
     /// <param name="window">Absolute media time range to decode, from the keyframe before a part's first page to that page. Its start must be a keyframe from the keyframe scan: the decode seeks there, so a demuxer that seeks by timestamp, such as MPEG-TS, decodes from that keyframe rather than the next one, and the frame times fall on the scan's timeline.</param>
     /// <param name="cancellationToken">Token used to cancel the FFmpeg process.</param>
-    /// <returns>The frames' visuals in presentation order, with times in media seconds, or <see langword="null"/> when the decode cannot be trusted: ffmpeg failed to run or exited nonzero, or its output crossed the byte cap. A frame whose block lacks a statistic is left out.</returns>
-    Task<KeyframeVisual[]?> DecodeCutWindowAsync(QueuedEpisode episode, TimeRange window, CancellationToken cancellationToken = default);
+    /// <returns>The frames in presentation order, each with its time in media seconds and its visual, or <see langword="null"/> when the decode cannot be trusted: ffmpeg failed to run or exited nonzero, or its output crossed the byte cap. A frame whose block lacks a statistic is left out.</returns>
+    Task<CutFrame[]?> DecodeCutWindowAsync(QueuedEpisode episode, TimeRange window, CancellationToken cancellationToken = default);
 
     /// <summary>
     /// Detects key frames in a media file within a time range.

@@ -44,6 +44,7 @@ public sealed class TestConfigHasher
         nameof(PluginConfiguration.ProcessThreads),
         nameof(PluginConfiguration.ScanTimeoutSeconds),
         nameof(PluginConfiguration.ProcessPriority),
+        nameof(PluginConfiguration.UseHardwareDecoding),
         nameof(PluginConfiguration.UseFileTransformationPlugin),
         nameof(PluginConfiguration.SkipbuttonHideDelay),
         nameof(PluginConfiguration.AutoSkipIntro),
@@ -51,6 +52,39 @@ public sealed class TestConfigHasher
         nameof(PluginConfiguration.SkipButtonVisibleSeconds),
         nameof(PluginConfiguration.EnableMainMenu),
     ];
+
+    [Fact]
+    public void PlaybackOffsets_InvalidateOnlyTheirAnalysisMode()
+    {
+        var defaults = new PluginConfiguration();
+        var intro = new PluginConfiguration { IntroStartOffset = 1 };
+        var credits = new PluginConfiguration { CreditsStartOffset = 1 };
+        var creditsWithIntroSnapEnabled = new PluginConfiguration
+        {
+            CreditsStartOffset = 1,
+            IncludeIntroStartOffsetWhenSnapping = true,
+        };
+        var legacyCreditsOffset = new PluginConfiguration { IntroStartOffset = 1 };
+        var creditsEnd = new PluginConfiguration { CreditsEndOffset = 1.5 };
+        var creditsEndSnap = new PluginConfiguration { CreditsEndOffset = 1.5, IncludeCreditsEndOffsetWhenSnapping = true };
+        var introHash = ConfigHasher.Analysis(defaults, AnalysisMode.Introduction, AnalyzerAction.Default, true);
+        var creditsHash = ConfigHasher.Analysis(defaults, AnalysisMode.Credits, AnalyzerAction.Default, true);
+
+        Assert.NotEqual(introHash, ConfigHasher.Analysis(intro, AnalysisMode.Introduction, AnalyzerAction.Default, true));
+        Assert.Equal(creditsHash, ConfigHasher.Analysis(intro, AnalysisMode.Credits, AnalyzerAction.Default, true));
+        Assert.NotEqual(creditsHash, ConfigHasher.Analysis(credits, AnalysisMode.Credits, AnalyzerAction.Default, true));
+        Assert.Equal(
+            ConfigHasher.Analysis(credits, AnalysisMode.Credits, AnalyzerAction.Default, true),
+            ConfigHasher.Analysis(creditsWithIntroSnapEnabled, AnalysisMode.Credits, AnalyzerAction.Default, true));
+        Assert.NotEqual(
+            ConfigHasher.Analysis(legacyCreditsOffset, AnalysisMode.Credits, AnalyzerAction.Default, true),
+            ConfigHasher.Analysis(credits, AnalysisMode.Credits, AnalyzerAction.Default, true));
+        Assert.Equal(introHash, ConfigHasher.Analysis(credits, AnalysisMode.Introduction, AnalyzerAction.Default, true));
+        Assert.NotEqual(
+            ConfigHasher.Analysis(creditsEnd, AnalysisMode.Credits, AnalyzerAction.Default, true),
+            ConfigHasher.Analysis(creditsEndSnap, AnalysisMode.Credits, AnalyzerAction.Default, true));
+        Assert.Equal(introHash, ConfigHasher.Analysis(creditsEndSnap, AnalysisMode.Introduction, AnalyzerAction.Default, true));
+    }
 
     public static TheoryData<string, string, string, bool> Cases()
     {
@@ -84,8 +118,9 @@ public sealed class TestConfigHasher
         Case("BlackInterval cache changes with mode", Cache(threshold32, CacheEntryType.BlackInterval, AnalysisMode.Introduction), Cache(threshold32, CacheEntryType.BlackInterval, AnalysisMode.Credits), false);
         Case("BlackInterval cache differs from BlackFrame", Cache(threshold32, CacheEntryType.BlackFrame, AnalysisMode.Credits), Cache(threshold32, CacheEntryType.BlackInterval, AnalysisMode.Credits), false);
         Case("Credits BlackFrame cache invalidates pre-keyframe-filter rows", Cache(defaults, CacheEntryType.BlackFrame, AnalysisMode.Credits), "3C80558124EB7712", false);
-        Case("Credits KeyframeVisual cache invalidates pre-keyframe-filter rows", Cache(defaults, CacheEntryType.KeyframeVisual, AnalysisMode.Credits), "587D32B8BFB41219", false);
-        Case("Credits KeyframeVisual cache invalidates rows without the frame difference", Cache(defaults, CacheEntryType.KeyframeVisual, AnalysisMode.Credits), "0F5DAFC545AB413F", false);
+        Case("KeyframePage cache changes with threshold", Cache(threshold32, CacheEntryType.KeyframePage, AnalysisMode.Credits), Cache(threshold64, CacheEntryType.KeyframePage, AnalysisMode.Credits), false);
+        Case("KeyframePage cache invalidates rows of the first page shape", Cache(defaults, CacheEntryType.KeyframePage, AnalysisMode.Credits), "D9C3081C0BE29CD8", false);
+        Case("KeyframePage cache ignores minimum percentage", Cache(percentage85, CacheEntryType.KeyframePage, AnalysisMode.Credits), Cache(percentage95, CacheEntryType.KeyframePage, AnalysisMode.Credits), true);
         Case("Credits BlackInterval cache invalidates rows probed under tinted-zeroed thresholds", Cache(defaults, CacheEntryType.BlackInterval, AnalysisMode.Credits), "3BB44B93C34D3451", false);
         Case("Credits BlackInterval cache invalidates window-relative rows", Cache(defaults, CacheEntryType.BlackInterval, AnalysisMode.Credits), "AF78C247AC1C8ED0", false);
 
@@ -144,10 +179,13 @@ public sealed class TestConfigHasher
         Case("Credits analysis changes with the preview chapter pattern", Analysis(defaults, AnalysisMode.Credits), Analysis(new PluginConfiguration { ChapterAnalyzerPreviewPattern = "Next" }, AnalysisMode.Credits), false);
         Case("Credits analysis changes with the preview minimum", Analysis(defaults, AnalysisMode.Credits), Analysis(new PluginConfiguration { MinimumPreviewDuration = 30 }, AnalysisMode.Credits), false);
         Case("Credits analysis changes with the preview maximum", Analysis(defaults, AnalysisMode.Credits), Analysis(new PluginConfiguration { MaximumPreviewDuration = 60 }, AnalysisMode.Credits), false);
-        Case("Credits analysis ignores the preview minimum under chapter enhancement", Analysis(new PluginConfiguration { EnhanceChapterCredits = true }, AnalysisMode.Credits), Analysis(new PluginConfiguration { EnhanceChapterCredits = true, MinimumPreviewDuration = 30 }, AnalysisMode.Credits), true);
+        // A season that derives previews hashes the effective tail and voting limits so a changed
+        // preview boundary cannot leave its settled Credits result stale.
+        Case("Credits analysis tracks vote limits while previews derive", Analysis(new PluginConfiguration { AnimePreviewFromCreditsEnd = true }, AnalysisMode.Credits), Analysis(new PluginConfiguration { AnimePreviewFromCreditsEnd = true, MaximumPreviewDuration = 60 }, AnalysisMode.Credits), false);
+        Case("Credits analysis tracks the preview minimum under chapter enhancement", Analysis(new PluginConfiguration { AnimePreviewFromCreditsEnd = true, EnhanceChapterCredits = true }, AnalysisMode.Credits), Analysis(new PluginConfiguration { AnimePreviewFromCreditsEnd = true, EnhanceChapterCredits = true, MinimumPreviewDuration = 30 }, AnalysisMode.Credits), false);
         Case("Credits analysis ignores the preview chapter pattern under a BlackFrame action", ConfigHasher.Analysis(defaults, AnalysisMode.Credits, AnalyzerAction.BlackFrame, ffmpegValid: true), ConfigHasher.Analysis(new PluginConfiguration { ChapterAnalyzerPreviewPattern = "Next" }, AnalysisMode.Credits, AnalyzerAction.BlackFrame, ffmpegValid: true), true);
-        // Full-length chapters replace the preview duration limits; the pattern still applies.
-        Case("Credits analysis ignores the preview duration limits under full-length chapters", Analysis(new PluginConfiguration { FullLengthChapters = true }, AnalysisMode.Credits), Analysis(new PluginConfiguration { FullLengthChapters = true, MinimumPreviewDuration = 30, MaximumPreviewDuration = 60 }, AnalysisMode.Credits), true);
+        // Full-length chapters replace chapter duration limits, but preview voting still uses them.
+        Case("Credits analysis tracks vote limits under full-length chapters", Analysis(new PluginConfiguration { AnimePreviewFromCreditsEnd = true, FullLengthChapters = true }, AnalysisMode.Credits), Analysis(new PluginConfiguration { AnimePreviewFromCreditsEnd = true, FullLengthChapters = true, MinimumPreviewDuration = 30, MaximumPreviewDuration = 60 }, AnalysisMode.Credits), false);
         Case("Credits analysis changes with the preview chapter pattern under full-length chapters", Analysis(new PluginConfiguration { FullLengthChapters = true }, AnalysisMode.Credits), Analysis(new PluginConfiguration { FullLengthChapters = true, ChapterAnalyzerPreviewPattern = "Next" }, AnalysisMode.Credits), false);
         // Installs from before 10.11.22 still carry that release's default preview pattern.
         Case("Credits analysis keeps the pinned hash under the pre-10.11.22 default preview pattern", Analysis(new PluginConfiguration { ChapterAnalyzerPreviewPattern = @"(^|\s)(Preview|PV|Sneak\s?Peek|Coming\s?(Up|Soon)|Next\s+(time|on|episode)|Extra|Teaser|Trailer)(?!\sEnd)(\s|:|$)" }, AnalysisMode.Credits), "7EF68040EE4E4EC7", true);
@@ -157,11 +195,11 @@ public sealed class TestConfigHasher
         Case("Commercial analysis ignores chromaprint availability", Analysis(defaults, AnalysisMode.Commercial), Analysis(defaults, AnalysisMode.Commercial, ffmpegValid: false), true);
 
         // Frozen to what 12.0.5 wrote for seasons that do not derive previews, so with subtitle
-        // detection off they do not re-analyze Preview on upgrade. Seasons that derive previews
-        // carry the anchor token and re-derive once (12.0.5 wrote 2735F6E29B514900 for them).
+        // detection off they do not re-analyze Preview on upgrade. Deriving seasons carry an
+        // anchor token and a capped-minimum token so stale NoSegments results reopen once.
         // Enabling subtitle detection adds its own hash.
         Case("Preview analysis hash is pinned while subtitle detection is off", Analysis(defaults, AnalysisMode.Preview), "19C776EE18C06441", true);
-        Case("Preview analysis re-derives under the last-credits anchor", Analysis(new PluginConfiguration { AnimePreviewFromCreditsEnd = true }, AnalysisMode.Preview), "EEAC9F1E9F57CD47", true);
+        Case("Preview analysis re-derives under the last-credits anchor and capped minimum", Analysis(new PluginConfiguration { AnimePreviewFromCreditsEnd = true }, AnalysisMode.Preview), "299B40632EF94A9C", true);
 
         // 12.0.5 wrote 9F39FAF9AB4D7445 here, when a Chromaprint recap ended at the latest black
         // frame. The sting end token reruns Recap once in every season. 12.0.6 wrote
@@ -327,6 +365,8 @@ public sealed class TestConfigHasher
             () => new PluginConfiguration { ReanalyzeSettledSeasons = true },
             // Community sources and duration tolerance count only while fallback is on.
             () => new PluginConfiguration { EnableCommunityFallback = true },
+            // The end-snap option only affects output when a credits end offset is present.
+            () => new PluginConfiguration { CreditsEndOffset = 1 },
         ];
 
         var settings = typeof(PluginConfiguration)

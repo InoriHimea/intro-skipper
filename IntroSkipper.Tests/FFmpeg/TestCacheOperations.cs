@@ -9,6 +9,8 @@ using System;
 using System.Collections.Generic;
 using System.IO;
 using System.Linq;
+using System.Reflection;
+using System.Text.Json;
 using System.Threading;
 using System.Threading.Tasks;
 using IntroSkipper.Analyzers;
@@ -17,6 +19,12 @@ using IntroSkipper.Data;
 using IntroSkipper.Db;
 using IntroSkipper.FFmpeg;
 using IntroSkipper.Helper;
+using MediaBrowser.Controller.MediaEncoding;
+using MediaBrowser.Controller.Session;
+using MediaBrowser.Model.Configuration;
+using MediaBrowser.Model.Entities;
+using MediaBrowser.Model.Session;
+using Microsoft.EntityFrameworkCore;
 using Microsoft.Extensions.Logging;
 using Microsoft.Extensions.Logging.Abstractions;
 using Xunit;
@@ -528,104 +536,208 @@ public sealed class TestCacheOperations
     }
 
     /// <summary>
-    /// One keyframe scan serves both rows. After the black-frame scan of a fresh episode the
-    /// keyframe visuals row for the credits window exists, and the visuals read is served from
-    /// it: the path is broken before that read, so a second decode would fail instead.
-    /// With the item's cache rows deleted, the visuals read then decodes the window on its own.
-    /// Visuals from either decode pair with exactly one black-frame row within the service's join
-    /// tolerance, and ScanKeyframesAsync returns one page per black-frame row with the three visuals
-    /// on theirs. The pairing runs from visual to row, since the black-frame scan runs to end of file
-    /// and its rows past the window end have no visual.
-    /// credits.mp4 has a keyframe every 10 s; the window [5, 35] holds three.
+    /// One decode fills one row with every keyframe to the end of the file, and the window end is
+    /// applied at the read. credits.mp4 has a keyframe every 10 s, so the window [5, 35] holds three
+    /// visuals and a later read with a window to 40, which ends on a keyframe, finds four in the same
+    /// row. The path is broken before that read, so a second decode would fail instead.
     /// </summary>
     [FactSkipFFmpegTests]
-    public async Task DetectBlackFramesAsync_CachesKeyframeVisualsForTheCreditsWindow()
+    public async Task ScanKeyframesAsync_KeepsOneRowAndClipsItAtTheRead()
     {
         using var scope = new CachingPluginScope();
         var episode = FfmpegTestHelpers.QueueFile("video/credits.mp4");
         episode.Duration = 330;
         episode.CreditsFingerprintStart = 5;
         episode.CreditsFingerprintEnd = 35;
-        var path = episode.Path;
-        var service = scope.CreateFFmpegService();
+        var logger = new ScanLogger();
+        var service = scope.CreateFFmpegService(logger);
 
-        var blackFrames = await service.DetectBlackFramesAsync(episode, scope.Config);
-
-        Assert.NotEmpty(blackFrames);
-        Assert.Contains(blackFrames, frame => frame.Percentage == 100);
-        Assert.NotNull(scope.CacheDatabase.FindEntry(episode.EpisodeId, AnalysisMode.Credits, CacheEntryType.KeyframeVisual, 5, 35));
-
-        episode.Path = "/does/not/exist.mkv";
-        var shared = await service.DetectKeyframeVisualsAsync(episode, scope.Config);
-
-        Assert.Equal([5.0, 15.0, 25.0], shared.Select(visual => visual.Time));
-        AssertEachVisualPairsWithOneRow(shared);
-
-        episode.Path = path;
-        scope.CacheDatabase.DeleteForItem(episode.EpisodeId);
-        Assert.Null(scope.CacheDatabase.FindEntry(episode.EpisodeId, AnalysisMode.Credits, CacheEntryType.KeyframeVisual, 5, 35));
-        var separate = await service.DetectKeyframeVisualsAsync(episode, scope.Config);
-
-        Assert.Equal([5.0, 15.0, 25.0], separate.Select(visual => visual.Time));
-        AssertEachVisualPairsWithOneRow(separate);
-
-        // The service pairs the two rows into pages: one per black-frame row, the window's three with
-        // visuals, each on the row of its own keyframe.
         var pages = await service.ScanKeyframesAsync(episode, scope.Config);
 
-        Assert.Equal(blackFrames, pages.Select(page => page.Frame));
-        Assert.Equal([5.0, 15.0, 25.0], pages.Select(page => page.Visual).OfType<KeyframeVisual>().Select(visual => visual.Time));
-        Assert.All(pages, page => Assert.True(page.Visual is null || Math.Abs(page.Visual.Time - page.Frame.Time) <= 0.001));
+        Assert.Equal($"KeyframePage scan [5, 0] of \"{episode.Path}\" (id {episode.EpisodeId})", Assert.Single(logger.Messages));
+        Assert.Equal([5.0, 15.0, 25.0], VisualTimes(pages));
+        Assert.True(pages.Length > 3);
+        Assert.Contains(pages, page => page.BlackPercentage == 100);
+        Assert.NotNull(scope.CacheDatabase.FindEntry(episode.EpisodeId, AnalysisMode.Credits, CacheEntryType.KeyframePage, 5, 0));
 
-        void AssertEachVisualPairsWithOneRow(KeyframeVisual[] visuals)
-            => Assert.All(visuals, visual => Assert.Single(blackFrames, frame => Math.Abs(frame.Time - visual.Time) <= KeyframeJoin.Tolerance));
+        episode.Path = "/does/not/exist.mkv";
+        episode.CreditsFingerprintEnd = 40;
+        var wider = await service.ScanKeyframesAsync(episode, scope.Config);
+
+        Assert.Single(logger.Messages);
+        Assert.Equal(pages.Select(page => (page.Time, page.BlackPercentage)), wider.Select(page => (page.Time, page.BlackPercentage)));
+        Assert.Equal([5.0, 15.0, 25.0, 35.0], VisualTimes(wider));
+
+        static double[] VisualTimes(KeyframePage[] scanned) => [.. scanned.Where(page => page.Visual is not null).Select(page => page.Time)];
     }
 
     /// <summary>
-    /// A keyframe scan of a fresh episode decodes once: the black-frame scan runs first and writes
-    /// the visuals row, so the visuals read after it is a cache hit.
+    /// The second scan reads the row, since its path is broken, and gets every fact of every page
+    /// back. A fact the row lost would read correct on the first scan and wrong on every later one.
     /// </summary>
     [FactSkipFFmpegTests]
-    public async Task ScanKeyframesAsync_DecodesOnceOnAColdCache()
+    public async Task ScanKeyframesAsync_ReadsEveryFactBackFromTheRow()
     {
         using var scope = new CachingPluginScope();
-        var episode = FfmpegTestHelpers.QueueFile("video/credits.mp4");
-        episode.Duration = 330;
-        episode.CreditsFingerprintStart = 5;
-        episode.CreditsFingerprintEnd = 35;
-        var logger = new ScanLogger();
-        var service = scope.CreateFFmpegService(logger);
+        var episode = FfmpegTestHelpers.QueueFile("video/seek-sample.mp4");
+        episode.CreditsFingerprintEnd = 100000;
+        var service = scope.CreateFFmpegService();
 
-        var pages = await service.ScanKeyframesAsync(episode, scope.Config);
+        var fresh = await service.ScanKeyframesAsync(episode, scope.Config);
+        episode.Path = "/does/not/exist.mkv";
+        var cached = await service.ScanKeyframesAsync(episode, scope.Config);
 
-        Assert.Equal($"BlackFrame scan [5, 0] of \"{episode.Path}\" (id {episode.EpisodeId})", Assert.Single(logger.Messages));
-        Assert.Equal([5.0, 15.0, 25.0], pages.Select(page => page.Visual).OfType<KeyframeVisual>().Select(visual => visual.Time));
+        Assert.Contains(fresh, page => page.Visual!.FrameDifference > 0 && page.Visual.Saturation > 0);
+        Assert.Equal(fresh, cached);
     }
 
+    /// <summary>
+    /// A page's visual held a copy of the page's time until the cut decode's frames took that time
+    /// over. Rows written then keep their token, so they must read back as the same pages. The path
+    /// is broken, so a row that failed to read would run ffmpeg and throw.
+    /// </summary>
+    [Fact]
+    public async Task ScanKeyframesAsync_ReadsARowWhoseVisualsHoldTheirTime()
+    {
+        using var scope = new CachingPluginScope();
+        var episode = new QueuedEpisode { EpisodeId = Guid.NewGuid(), Path = "/does/not/exist.mkv", Duration = 330, CreditsFingerprintStart = 5, CreditsFingerprintEnd = 35 };
+        // Two pages of a row the keyframe scan wrote for an episode before the change.
+        const string Row = """[{"Time":3.78,"BlackPercentage":8,"Visual":{"Time":3.78,"LumaMin":0,"LumaLow":29,"LumaHigh":105,"LumaMax":133,"Saturation":6.30699,"FrameDifference":0}},{"Time":7.784,"BlackPercentage":6,"Visual":{"Time":7.784,"LumaMin":0,"LumaLow":29,"LumaHigh":106,"LumaMax":121,"Saturation":4.41675,"FrameDifference":23.023}}]""";
+        using var row = JsonDocument.Parse(Row);
+        scope.SeedRow(episode.EpisodeId, AnalysisMode.Credits, CacheEntryType.KeyframePage, DetectionCacheService.CompressBrotli(row.RootElement), 5, 0, ConfigHasher.DetectionCache(scope.Config, CacheEntryType.KeyframePage, AnalysisMode.Credits));
+
+        var pages = await scope.CreateFFmpegService().ScanKeyframesAsync(episode, scope.Config);
+
+        KeyframePage[] expected = [new(3.78, 8, new KeyframeVisual(0, 29, 105, 133, 6.30699, 0)), new(7.784, 6, new KeyframeVisual(0, 29, 106, 121, 4.41675, 23.023))];
+        Assert.Equal(expected, pages);
+    }
+
+    /// <summary>
+    /// A row is hashed under the threshold it was measured at, so a new threshold decodes again
+    /// rather than reading the old percentages.
+    /// </summary>
     [FactSkipFFmpegTests]
-    public async Task DetectKeyframeVisualsAsync_LogsCacheMissButNotCacheHit()
+    public async Task ScanKeyframesAsync_MeasuresAgainUnderANewThreshold()
     {
         using var scope = new CachingPluginScope();
         var episode = FfmpegTestHelpers.QueueFile("video/credits.mp4");
         episode.Duration = 330;
-        episode.CreditsFingerprintStart = 5;
-        episode.CreditsFingerprintEnd = 35;
-        scope.CacheService.Write<BlackFrame>(episode.EpisodeId, AnalysisMode.Credits, CacheEntryType.BlackFrame, 5, 0, scope.Config, []);
         var logger = new ScanLogger();
         var service = scope.CreateFFmpegService(logger);
 
-        await service.DetectBlackFramesAsync(episode, scope.Config);
-        Assert.Empty(logger.Messages);
+        await service.ScanKeyframesAsync(episode, new PluginConfiguration { BlackFrameThreshold = 28 });
+        await service.ScanKeyframesAsync(episode, new PluginConfiguration { BlackFrameThreshold = 64 });
 
-        var visuals = await service.DetectKeyframeVisualsAsync(episode, scope.Config);
+        Assert.Equal(2, logger.Messages.Count);
+    }
 
-        Assert.NotEmpty(visuals);
-        Assert.Equal($"KeyframeVisual scan [5, 35] of \"{episode.Path}\" (id {episode.EpisodeId})", Assert.Single(logger.Messages));
+    /// <summary>
+    /// A software run that fails partway keeps today's rule: ffmpeg wrote a frame and then exited
+    /// nonzero, so the page stands and the row is cached.
+    /// </summary>
+    [Fact]
+    public async Task ScanKeyframesAsync_CachesThePagesANonzeroExitLeft()
+    {
+        using var scope = new CachingPluginScope();
+        using var ffmpeg = new FakeFfmpegScript(
+            "[showinfo@TOKEN @ 0x1] config in time_base: 1/1000, frame_rate: 25/1\n[showinfo@TOKEN @ 0x1] n:   0 pts:   1000 pts_time:1 fmt:yuv420p cl:left sar:1/1 s:4x2 i:P iskey:1 type:I \n",
+            [.. Enumerable.Repeat((byte)16, 8), .. Enumerable.Repeat((byte)128, 4)]);
+        var episode = FailedRunEpisode();
 
-        episode.Path = "/does/not/exist.mkv";
-        await service.DetectKeyframeVisualsAsync(episode, scope.Config);
+        var pages = await scope.CreateFFmpegService().ScanKeyframesAsync(episode, scope.Config);
 
-        Assert.Single(logger.Messages);
+        Assert.Equal(1.0, Assert.Single(pages).Time);
+        Assert.NotNull(scope.CacheDatabase.FindEntry(episode.EpisodeId, AnalysisMode.Credits, CacheEntryType.KeyframePage, 5, 0));
+    }
+
+    /// <summary>
+    /// An empty row cached for a run that broke the pipe's protocol would read as an episode with no
+    /// keyframes from then on, so the run throws and leaves no row.
+    /// </summary>
+    [Fact]
+    public async Task ScanKeyframesAsync_AProtocolErrorCachesNothing()
+    {
+        using var scope = new CachingPluginScope();
+        using var ffmpeg = new FakeFfmpegScript(string.Empty, [1]);
+        var episode = FailedRunEpisode();
+
+        await Assert.ThrowsAsync<InvalidDataException>(() => scope.CreateFFmpegService().ScanKeyframesAsync(episode, scope.Config));
+
+        Assert.Null(scope.CacheDatabase.FindEntry(episode.EpisodeId, AnalysisMode.Credits, CacheEntryType.KeyframePage, 5, 0));
+    }
+
+    /// <summary>
+    /// A wedged ffmpeg must not hold the analysis worker past the scan timeout, and a timed-out run
+    /// leaves no row. The script would end on its own only after 20 s, without an error.
+    /// </summary>
+    [Fact]
+    public async Task ScanKeyframesAsync_ATimedOutRunThrowsAndCachesNothing()
+    {
+        using var scope = new CachingPluginScope();
+        scope.Config.ScanTimeoutSeconds = 2;
+        using var ffmpeg = new FakeFfmpegScript(string.Empty, [], hangs: true);
+        var episode = FailedRunEpisode();
+
+        await Assert.ThrowsAsync<TimeoutException>(() => scope.CreateFFmpegService().ScanKeyframesAsync(episode, scope.Config));
+
+        Assert.Null(scope.CacheDatabase.FindEntry(episode.EpisodeId, AnalysisMode.Credits, CacheEntryType.KeyframePage, 5, 0));
+    }
+
+    /// <summary>
+    /// Cancelling kills ffmpeg rather than waiting for it. The bound matters: a scan that ignored
+    /// the token in its run would still cancel, but only after the script's 20 s.
+    /// </summary>
+    [Fact]
+    public async Task ScanKeyframesAsync_CancellingKillsTheRunAndCachesNothing()
+    {
+        using var scope = new CachingPluginScope();
+        using var ffmpeg = new FakeFfmpegScript(string.Empty, [], hangs: true);
+        var episode = FailedRunEpisode();
+        using var cancellation = new CancellationTokenSource(TimeSpan.FromSeconds(2));
+
+        var scan = scope.CreateFFmpegService().ScanKeyframesAsync(episode, scope.Config, cancellation.Token);
+
+        await Assert.ThrowsAnyAsync<OperationCanceledException>(() => scan.WaitAsync(TimeSpan.FromSeconds(10), CancellationToken.None));
+        Assert.Null(scope.CacheDatabase.FindEntry(episode.EpisodeId, AnalysisMode.Credits, CacheEntryType.KeyframePage, 5, 0));
+    }
+
+    /// <summary>
+    /// The scan's old rows go once, by key, from a database that held them, including rows with no
+    /// hash, which would otherwise stay readable. The legacy analyzer's range rows share the
+    /// black-frame type and token and stay. Once done, a later open leaves a row of the old shape alone.
+    /// </summary>
+    [Fact]
+    public void OpeningTheCache_RetiresTheTwoRowScanOnce()
+    {
+        using var scope = new CachingPluginScope();
+        var itemId = Guid.NewGuid();
+        (AnalysisMode Mode, CacheEntryType Type, double Start, double End, bool Stays)[] rows =
+        [
+            (AnalysisMode.Credits, CacheEntryType.BlackFrame, 5, 0, false),
+            (AnalysisMode.Credits, CacheEntryType.KeyframePage, 5, 35, false),
+            (AnalysisMode.Credits, CacheEntryType.KeyframePage, 5, 0, true),
+            (AnalysisMode.Credits, CacheEntryType.BlackFrame, 5, 35, true),
+            (AnalysisMode.Recap, CacheEntryType.BlackFrame, 0, 0, true),
+            (AnalysisMode.Credits, CacheEntryType.BlackInterval, 5, 35, true),
+        ];
+        foreach (var (mode, type, start, end, _) in rows)
+        {
+            scope.SeedRow(itemId, mode, type, EntrypointTestHelpers.EmptyJsonArray, start, end);
+        }
+
+        using (var db = DatabaseTestHelpers.CreateCacheContext(scope.CacheDbPath))
+        {
+            db.Database.ExecuteSqlRaw("PRAGMA user_version = 0");
+        }
+
+        var upgraded = DatabaseTestHelpers.CreateCacheDatabase(scope.CacheDbPath);
+
+        Assert.All(rows, row => Assert.Equal(row.Stays, upgraded.FindEntry(itemId, row.Mode, row.Type, row.Start, row.End) is not null));
+
+        upgraded.Upsert(itemId, AnalysisMode.Credits, CacheEntryType.BlackFrame, 5, 0, EntrypointTestHelpers.EmptyJsonArray, string.Empty);
+        var reopened = DatabaseTestHelpers.CreateCacheDatabase(scope.CacheDbPath);
+
+        Assert.NotNull(reopened.FindEntry(itemId, AnalysisMode.Credits, CacheEntryType.BlackFrame, 5, 0));
     }
 
     /// <summary>
@@ -644,8 +756,7 @@ public sealed class TestCacheOperations
             CreditsFingerprintStart = 5,
             CreditsFingerprintEnd = 35,
         };
-        scope.CacheService.Write<BlackFrame>(episode.EpisodeId, AnalysisMode.Credits, CacheEntryType.BlackFrame, 5, 0, scope.Config, [new(100, 0, 0)]);
-        scope.CacheService.Write<KeyframeVisual>(episode.EpisodeId, AnalysisMode.Credits, CacheEntryType.KeyframeVisual, 5, 35, scope.Config, [new(0, 16, 16, 16, 16, 0, 0)]);
+        scope.CacheService.Write<KeyframePage>(episode.EpisodeId, AnalysisMode.Credits, CacheEntryType.KeyframePage, 5, 0, scope.Config, [new(0, 100, new KeyframeVisual(16, 16, 16, 16, 0, 0))]);
         scope.CacheService.Write<double>(episode.EpisodeId, AnalysisMode.Introduction, CacheEntryType.Keyframe, 0, 30, scope.Config, [10]);
         var logger = new ScanLogger();
         var service = scope.CreateFFmpegService(logger);
@@ -678,7 +789,7 @@ public sealed class TestCacheOperations
                 var episode = new QueuedEpisode { EpisodeId = Guid.NewGuid(), Path = path, Duration = 2, CreditsFingerprintStart = 0, CreditsFingerprintEnd = 2 };
                 var logger = new ScanLogger();
 
-                await scope.CreateFFmpegService(logger).DetectBlackFramesAsync(episode, scope.Config);
+                await scope.CreateFFmpegService(logger).ScanKeyframesAsync(episode, scope.Config);
 
                 return Assert.Single(logger.Processes, process => process.Contains("-skip_frame", StringComparison.Ordinal));
             }
@@ -754,15 +865,501 @@ public sealed class TestCacheOperations
         episode.CreditsFingerprintEnd = 1;
         var logger = new ScanLogger();
 
-        var frames = await scope.CreateFFmpegService(logger).DetectBlackFramesAsync(episode, scope.Config);
+        var pages = await scope.CreateFFmpegService(logger).ScanKeyframesAsync(episode, scope.Config);
 
-        Assert.NotEmpty(frames);
-        Assert.All(frames, frame => Assert.Equal(0, frame.Percentage));
+        Assert.NotEmpty(pages);
+        Assert.All(pages, page => Assert.Equal(0, page.BlackPercentage));
         Assert.Collection(
             logger.Processes.Where(process => process.Contains("-skip_frame", StringComparison.Ordinal)),
             slice => Assert.Contains("-thread_type slice", slice, StringComparison.Ordinal),
             frame => Assert.DoesNotContain("-thread_type", frame, StringComparison.Ordinal));
     }
+
+    /// <summary>
+    /// Each acceleration type maps to the hwaccel Jellyfin decodes with, on the device Jellyfin's
+    /// VAAPI or QSV setting names (the row's device is in the setting its type reads, and a 9 in
+    /// the other) and only on the platforms where Jellyfin decodes with it, so each row names the
+    /// method on Linux, Windows and macOS. NVENC is the exception: it maps to CUDA on macOS too,
+    /// where Jellyfin never uses CUDA. QSV decodes on hardware only while
+    /// PreferSystemNativeHwDecoder is on, and on Windows opens the adapter by the device's index
+    /// when it is one. The types the scans keep in software add nothing. Only the column of the OS
+    /// the tests run on is checked, and CI runs none on macOS.
+    /// </summary>
+    [Theory]
+    [InlineData(HardwareAccelerationType.vaapi, "/dev/dri/renderD129", true, "-hwaccel vaapi -hwaccel_device /dev/dri/renderD129", "", "")]
+    [InlineData(HardwareAccelerationType.vaapi, "", true, "-hwaccel vaapi", "", "")]
+    [InlineData(HardwareAccelerationType.nvenc, "/dev/dri/renderD129", true, "-hwaccel cuda", "-hwaccel cuda", "-hwaccel cuda")]
+    [InlineData(HardwareAccelerationType.amf, "/dev/dri/renderD129", true, "", "-init_hw_device d3d11va=dx11:,vendor=0x1002 -hwaccel d3d11va", "")]
+    [InlineData(HardwareAccelerationType.none, "", true, "", "", "")]
+    [InlineData(HardwareAccelerationType.qsv, "", true, "-init_hw_device vaapi=va:,vendor_id=0x8086,driver=iHD -hwaccel vaapi", "-init_hw_device d3d11va=dx11:,vendor=0x8086 -hwaccel d3d11va", "")]
+    [InlineData(HardwareAccelerationType.qsv, "1", true, "-init_hw_device vaapi=va:,vendor_id=0x8086,driver=iHD -hwaccel vaapi", "-init_hw_device d3d11va=dx11:1 -hwaccel d3d11va", "")]
+    [InlineData(HardwareAccelerationType.qsv, "-1", true, "-init_hw_device vaapi=va:,vendor_id=0x8086,driver=iHD -hwaccel vaapi", "-init_hw_device d3d11va=dx11:0 -hwaccel d3d11va", "")]
+    [InlineData(HardwareAccelerationType.qsv, "", false, "", "", "")]
+    [InlineData(HardwareAccelerationType.videotoolbox, "", true, "", "", "-hwaccel videotoolbox")]
+    [InlineData(HardwareAccelerationType.rkmpp, "", true, "", "", "")]
+    [InlineData(HardwareAccelerationType.v4l2m2m, "", true, "", "", "")]
+    public void HardwareDecodeMethod_FollowsJellyfinsAccelerationType(HardwareAccelerationType type, string device, bool preferNative, string linux, string windows, string macOS)
+    {
+        var qsv = type == HardwareAccelerationType.qsv;
+        var encoding = new EncodingOptions { HardwareAccelerationType = type, VaapiDevice = qsv ? "9" : device, QsvDevice = qsv ? device : "9", PreferSystemNativeHwDecoder = preferNative };
+        var expected = OperatingSystem.IsWindows() ? windows : OperatingSystem.IsMacOS() ? macOS : linux;
+
+        Assert.Equal(expected, string.Join(' ', FFmpegService.HardwareDecodeMethod(encoding)));
+    }
+
+    /// <summary>
+    /// QSV on Linux decodes through VAAPI on the device Jellyfin's default native path opens: the
+    /// render node when QsvDevice names an existing file, otherwise the vendor. With
+    /// PreferSystemNativeHwDecoder off, Jellyfin takes its QSV decoder path, which stays in software.
+    /// </summary>
+    [Theory]
+    [InlineData("existing", true, "-init_hw_device vaapi=va:{device},driver=iHD -hwaccel vaapi")]
+    [InlineData("missing", true, "-init_hw_device vaapi=va:,vendor_id=0x8086,driver=iHD -hwaccel vaapi")]
+    [InlineData("existing", false, "")]
+    public void LinuxQsvMethod_MirrorsJellyfinsNativeDevice(string device, bool preferNative, string expected)
+    {
+        var path = Path.GetTempFileName();
+        try
+        {
+            if (device == "missing")
+            {
+                File.Delete(path);
+            }
+
+            var encoding = new EncodingOptions { QsvDevice = path, PreferSystemNativeHwDecoder = preferNative };
+
+            Assert.Equal(expected.Replace("{device}", path, StringComparison.Ordinal), string.Join(' ', FFmpegService.LinuxQsvMethod(encoding)));
+        }
+        finally
+        {
+            File.Delete(path);
+        }
+    }
+
+    /// <summary>
+    /// Only H.264 and HEVC in the measured 4:2:0 formats decode on hardware, and only while Jellyfin
+    /// decodes the codec on hardware for playback, and for 10-bit HEVC while it decodes 10-bit HEVC
+    /// there. Hi10P H.264, HEVC RExt and AV1 stay in software.
+    /// </summary>
+    [Theory]
+    [InlineData("h264", "yuv420p", "h264", true, true)]
+    [InlineData("h264", "yuvj420p", "h264", true, true)]
+    [InlineData("hevc", "yuv420p", "h264,hevc", true, true)]
+    [InlineData("hevc", "yuv420p", "h264", true, false)]
+    [InlineData("hevc", "yuv420p10le", "hevc", true, true)]
+    [InlineData("hevc", "yuv420p10le", "hevc", false, false)]
+    [InlineData("h264", "yuv420p10le", "h264", true, false)]
+    [InlineData("hevc", "yuv420p12le", "hevc", true, false)]
+    [InlineData("hevc", "yuv422p10le", "hevc", true, false)]
+    [InlineData("hevc", "yuv444p", "hevc", true, false)]
+    [InlineData("hevc", null, "hevc", true, false)]
+    [InlineData("av1", "yuv420p", "h264,hevc,av1", true, false)]
+    [InlineData(null, null, "h264,hevc", true, false)]
+    public void DecodesOnHardware_TakesOnlyTheMeasuredFormatsJellyfinDecodesOnHardware(string? codec, string? pixelFormat, string ticked, bool tenBitHevc, bool hardware)
+    {
+        var encoding = new EncodingOptions { HardwareDecodingCodecs = ticked.Split(','), EnableDecodingColorDepth10Hevc = tenBitHevc };
+
+        Assert.Equal(hardware, FFmpegService.DecodesOnHardware(encoding, codec is null ? null : new(codec, pixelFormat, null)));
+    }
+
+    /// <summary>
+    /// By default Jellyfin keeps these profiles in software whatever the pixel format, and the container tag
+    /// ffmpeg prints after the profile must not hide it. Stream lines as jellyfin-ffmpeg prints them.
+    /// </summary>
+    [Theory]
+    [InlineData("h264 (High 4:2:2), yuv420p(tv, bt709, progressive)", false)]
+    [InlineData("h264 (High 4:2:2) (avc1 / 0x31637661), yuv420p(tv, bt709, progressive)", false)]
+    [InlineData("h264 (High 4:4:4 Predictive), yuv420p(tv, bt709, progressive)", false)]
+    [InlineData("h264 (High 4:4:4 Predictive) (avc1 / 0x31637661), yuv420p(tv, bt709, progressive)", false)]
+    [InlineData("hevc (Rext), yuv420p10le(tv, bt709)", false)]
+    [InlineData("hevc (Rext) (hvc1 / 0x31637668), yuv420p10le(tv, bt709)", false)]
+    [InlineData("h264 (High) (avc1 / 0x31637661), yuv420p(tv, bt709, progressive)", true)]
+    [InlineData("h264 (avc1 / 0x31637661), yuv420p(tv, bt709, progressive)", true)]
+    [InlineData("hevc (Main 10) (hvc1 / 0x31637668), yuv420p10le(tv, bt709)", true)]
+    public void DecodesOnHardware_RefusesTheProfilesJellyfinKeepsInSoftware(string streamDescription, bool hardware)
+    {
+        var encoding = new EncodingOptions { HardwareDecodingCodecs = ["h264", "hevc"], EnableDecodingColorDepth10Hevc = true };
+        var codec = streamDescription[..4];
+        var stderr = $"""
+              Stream #0:0: Video: {streamDescription}, 1920x1080, 23.98 fps
+            Stream mapping:
+              Stream #0:0 -> #0:0 ({codec} (native) -> rawvideo (native))
+            """;
+
+        Assert.Equal(hardware, FFmpegService.DecodesOnHardware(encoding, FFmpegOutputParser.ParseMappedVideoStream(stderr)));
+    }
+
+    /// <summary>
+    /// The black interval probe starts on the hardware while the setting is on, here with neither
+    /// of Jellyfin's services, which passes both gates. The legacy
+    /// analyzer's black-frame and keyframe time scans, the cut decode and the silence scan stay in
+    /// software, and with the setting off every scan does. The fallback tests below cover the
+    /// keyframe and recap scans' hardware runs.
+    /// </summary>
+    [Theory]
+    [InlineData("intervals", true, true)]
+    [InlineData("legacy", true, false)]
+    [InlineData("keyframe times", true, false)]
+    [InlineData("cut", true, false)]
+    [InlineData("silence", true, false)]
+    [InlineData("keyframes", false, false)]
+    [InlineData("recap", false, false)]
+    [InlineData("intervals", false, false)]
+    public async Task Scans_DecodeOnHardwareOnlyWhereItApplies(string scan, bool enabled, bool hardware)
+    {
+        using var scope = new CachingPluginScope();
+        scope.Config.UseHardwareDecoding = enabled;
+        using var ffmpeg = new FakeFfmpegScript(string.Empty, [], probe: ProbeLog("h264", "yuv420p"));
+        var episode = FailedRunEpisode();
+        var logger = new ScanLogger();
+        var service = scope.CreateFFmpegService(logger, NvencEncoding());
+
+        await RunScan(service, scan, episode, scope.Config);
+
+        Assert.Equal(hardware, logger.Processes.Any(process => process.Contains("-hwaccel cuda -xerror ", StringComparison.Ordinal)));
+    }
+
+    public static TheoryData<string, string, bool> JellyfinGateCases()
+    {
+        var cases = new TheoryData<string, string, bool>();
+        foreach (var scan in new[] { "keyframes", "recap", "intervals" })
+        {
+            cases.Add(scan, "supported and idle", true);
+            cases.Add(scan, "unsupported", false);
+            cases.Add(scan, "video transcode", false);
+            cases.Add(scan, "video remux", true);
+            cases.Add(scan, "audio only transcode", true);
+            cases.Add(scan, "direct session", true);
+        }
+
+        return cases;
+    }
+
+    /// <summary>
+    /// All three scans start on hardware only while Jellyfin's ffmpeg has the hwaccel and no session
+    /// transcodes video. A closed gate decides before the codec probe, which the recap and interval
+    /// scans would run only to choose hardware.
+    /// </summary>
+    [Theory]
+    [MemberData(nameof(JellyfinGateCases))]
+    public async Task Scans_FollowJellyfinsHardwareGates(string scan, string situation, bool hardware)
+    {
+        using var scope = new CachingPluginScope();
+        scope.Config.UseHardwareDecoding = true;
+        using var ffmpeg = new FakeFfmpegScript(string.Empty, [], probe: ProbeLog("h264", "yuv420p"));
+        var logger = new ScanLogger();
+        var encoder = FakeMediaEncoder.Create(situation == "unsupported" ? [] : ["cuda"]);
+        var sessions = situation switch
+        {
+            "video transcode" => FakeSessionManager.Create(null, new TranscodingInfo { IsVideoDirect = false, VideoCodec = "h264" }),
+            "video remux" => FakeSessionManager.Create(new TranscodingInfo { IsVideoDirect = true, VideoCodec = "h264", IsAudioDirect = false }),
+            "audio only transcode" => FakeSessionManager.Create(new TranscodingInfo { IsVideoDirect = false, VideoCodec = null, IsAudioDirect = false }),
+            "direct session" => FakeSessionManager.Create((TranscodingInfo?)null),
+            _ => FakeSessionManager.Create(),
+        };
+        var service = scope.CreateFFmpegService(logger, NvencEncoding(), encoder, sessions);
+
+        await RunScan(service, scan, FailedRunEpisode(), scope.Config);
+
+        Assert.Equal(hardware, logger.Processes.Any(process => process.Contains("-hwaccel cuda -xerror ", StringComparison.Ordinal)));
+        if (!hardware && scan != "keyframes")
+        {
+            Assert.DoesNotContain(logger.Processes, process => process.Contains("-frames:v 0", StringComparison.Ordinal));
+        }
+    }
+
+    public static TheoryData<HardwareAccelerationType, string> HwaccelsByType()
+    {
+        var cases = new TheoryData<HardwareAccelerationType, string> { { HardwareAccelerationType.nvenc, "cuda" } };
+        if (OperatingSystem.IsWindows())
+        {
+            cases.Add(HardwareAccelerationType.amf, "d3d11va");
+            cases.Add(HardwareAccelerationType.qsv, "d3d11va");
+        }
+
+        if (OperatingSystem.IsLinux())
+        {
+            cases.Add(HardwareAccelerationType.vaapi, "vaapi");
+            cases.Add(HardwareAccelerationType.qsv, "vaapi");
+        }
+
+        if (OperatingSystem.IsMacOS())
+        {
+            cases.Add(HardwareAccelerationType.videotoolbox, "videotoolbox");
+        }
+
+        return cases;
+    }
+
+    /// <summary>
+    /// The support check names the hwaccel the method decodes with, which is vaapi for QSV on Linux
+    /// and d3d11va for AMF and for QSV on Windows, not the acceleration type's own name.
+    /// </summary>
+    [Theory]
+    [MemberData(nameof(HwaccelsByType))]
+    public async Task HardwareGate_AsksForTheHwaccelTheMethodUses(HardwareAccelerationType type, string hwaccel)
+    {
+        string[] allHwaccels = ["cuda", "vaapi", "d3d11va", "qsv", "amf", "videotoolbox"];
+        using var scope = new CachingPluginScope();
+        scope.Config.UseHardwareDecoding = true;
+        using var ffmpeg = new FakeFfmpegScript(string.Empty, [], probe: ProbeLog("h264", "yuv420p"));
+        var encoding = new EncodingOptions { HardwareAccelerationType = type, VaapiDevice = string.Empty, HardwareDecodingCodecs = ["h264"] };
+
+        var withIt = new ScanLogger();
+        await scope.CreateFFmpegService(withIt, encoding, FakeMediaEncoder.Create([hwaccel])).DetectBlackFramesAsync(FailedRunEpisode(), new TimeRange(0, 30), 0, AnalysisMode.Recap, scope.Config);
+        var withoutIt = new ScanLogger();
+        await scope.CreateFFmpegService(withoutIt, encoding, FakeMediaEncoder.Create([.. allHwaccels.Where(name => name != hwaccel)])).DetectBlackFramesAsync(FailedRunEpisode(), new TimeRange(0, 30), 0, AnalysisMode.Recap, scope.Config);
+
+        Assert.Contains(withIt.Processes, process => process.Contains($"-hwaccel {hwaccel} -xerror ", StringComparison.Ordinal));
+        Assert.DoesNotContain(withoutIt.Processes, process => process.Contains("-hwaccel", StringComparison.Ordinal));
+    }
+
+    /// <summary>
+    /// A recap or interval scan asks for the codec only to choose hardware, so a codec probe that
+    /// is cut at its cap or hangs past the scan timeout leaves it to run in software. It must not
+    /// fail the scan.
+    /// </summary>
+    [Theory]
+    [InlineData("recap", "cut")]
+    [InlineData("recap", "hangs")]
+    [InlineData("intervals", "cut")]
+    [InlineData("intervals", "hangs")]
+    public async Task Scans_RunInSoftwareWhenTheHardwareGatesCodecProbeFails(string scan, string failure)
+    {
+        using var scope = new CachingPluginScope();
+        scope.Config.UseHardwareDecoding = true;
+        scope.Config.ScanTimeoutSeconds = 2;
+        using var ffmpeg = new FakeFfmpegScript(string.Empty, [], probe: failure == "cut" ? ProbePastTheCap : string.Empty, probeHangs: failure == "hangs");
+        var logger = new ScanLogger();
+
+        await RunScan(scope.CreateFFmpegService(logger, NvencEncoding()), scan, FailedRunEpisode(), scope.Config);
+
+        Assert.Single(logger.Processes, process => process.Contains("-frames:v 0", StringComparison.Ordinal));
+        var run = Assert.Single(logger.Processes, process => !process.Contains("-frames:v 0", StringComparison.Ordinal));
+        Assert.DoesNotContain("-hwaccel", run, StringComparison.Ordinal);
+    }
+
+    /// <summary>
+    /// The keyframe scan needs the codec to read its pages at all, so with hardware decode on, a
+    /// codec probe cut at its cap still fails the scan, after one probe, and caches nothing.
+    /// </summary>
+    [Fact]
+    public async Task KeyframeScan_StillFailsWhenTheCodecProbeFailsUnderHardwareDecode()
+    {
+        using var scope = new CachingPluginScope();
+        scope.Config.UseHardwareDecoding = true;
+        using var ffmpeg = new FakeFfmpegScript(PageLog(1000), Frame, probe: ProbePastTheCap);
+        var episode = FailedRunEpisode();
+        var logger = new ScanLogger();
+
+        await Assert.ThrowsAsync<InvalidDataException>(() => scope.CreateFFmpegService(logger, NvencEncoding()).ScanKeyframesAsync(episode, scope.Config));
+
+        Assert.Single(logger.Processes, process => process.Contains("-frames:v 0", StringComparison.Ordinal));
+        Assert.DoesNotContain(logger.Processes, process => process.Contains("rawvideo", StringComparison.Ordinal));
+        Assert.False(scope.CacheService.TryRead<KeyframePage>(episode.EpisodeId, AnalysisMode.Credits, CacheEntryType.KeyframePage, 5, 0, scope.Config, out _));
+    }
+
+    /// <summary>
+    /// A hardware decode whose device cannot be opened exits before the first frame. The scan runs
+    /// again in software and caches the frames a software scan finds, not the failed run's empty
+    /// output. Linux only: no other platform takes the VAAPI method, and there the missing device
+    /// fails before any decode starts.
+    /// </summary>
+    [FactLinuxFFmpegTests]
+    public async Task RecapBlackFrameScan_FallsBackToSoftwareWhenTheDeviceIsMissing()
+    {
+        var range = new TimeRange(0, 4);
+        BlackFrame[] software;
+        using (var scope = new CachingPluginScope())
+        {
+            software = await scope.CreateFFmpegService().DetectBlackFramesAsync(FfmpegTestHelpers.QueueFile("video/credits.mp4"), range, 0, AnalysisMode.Recap, scope.Config);
+        }
+
+        using (var scope = new CachingPluginScope())
+        {
+            scope.Config.UseHardwareDecoding = true;
+            var episode = FfmpegTestHelpers.QueueFile("video/credits.mp4");
+            var logger = new ScanLogger();
+            var encoding = new EncodingOptions { HardwareAccelerationType = HardwareAccelerationType.vaapi, VaapiDevice = "/dev/dri/renderD199", HardwareDecodingCodecs = ["h264"] };
+            var service = scope.CreateFFmpegService(logger, encoding);
+
+            var hardware = await service.DetectBlackFramesAsync(episode, range, 0, AnalysisMode.Recap, scope.Config);
+            var before = logger.Processes.Count;
+            var cached = await service.DetectBlackFramesAsync(episode, range, 0, AnalysisMode.Recap, scope.Config);
+
+            Assert.Equal(software, hardware);
+            Assert.Equal(software, cached);
+            Assert.Equal(before, logger.Processes.Count);
+            Assert.Collection(
+                logger.Processes.Where(process => process.Contains("blackframe", StringComparison.Ordinal)),
+                first => Assert.Contains("-hwaccel vaapi -hwaccel_device /dev/dri/renderD199", first, StringComparison.Ordinal),
+                retry => Assert.DoesNotContain("-hwaccel", retry, StringComparison.Ordinal));
+        }
+    }
+
+    /// <summary>
+    /// With the setting on but no hardware method under Jellyfin's acceleration type, a recap scan
+    /// starts no codec probe: only the scan itself runs.
+    /// </summary>
+    [Fact]
+    public async Task RecapBlackFrameScan_ProbesNothingWithoutAHardwareMethod()
+    {
+        using var scope = new CachingPluginScope();
+        scope.Config.UseHardwareDecoding = true;
+        using var ffmpeg = new FakeFfmpegScript(string.Empty, [], probe: ProbeLog("h264", "yuv420p"));
+        var logger = new ScanLogger();
+        var rkmpp = new EncodingOptions { HardwareAccelerationType = HardwareAccelerationType.rkmpp, HardwareDecodingCodecs = ["h264"] };
+
+        await scope.CreateFFmpegService(logger, rkmpp).DetectBlackFramesAsync(FailedRunEpisode(), new TimeRange(0, 30), 0, AnalysisMode.Recap, scope.Config);
+
+        Assert.Contains("blackframe", Assert.Single(logger.Processes), StringComparison.Ordinal);
+    }
+
+    /// <summary>
+    /// A hardware run that exits 0 is the scan: its page is used and cached, and no software run
+    /// starts.
+    /// </summary>
+    [Fact]
+    public async Task KeyframeScan_UsesAndCachesASuccessfulHardwareRun()
+    {
+        using var scope = new CachingPluginScope();
+        scope.Config.UseHardwareDecoding = true;
+        using var ffmpeg = new FakeFfmpegScript(PageLog(1000), Frame, probe: ProbeLog("h264", "yuv420p"), hardwareLog: PageLog(2000), hardwareFrames: Frame, hardwareExitCode: 0);
+        var episode = FailedRunEpisode();
+        var logger = new ScanLogger();
+        var service = scope.CreateFFmpegService(logger, NvencEncoding());
+
+        var pages = await service.ScanKeyframesAsync(episode, scope.Config);
+        var cached = await service.ScanKeyframesAsync(episode, scope.Config);
+
+        Assert.Equal(2.0, Assert.Single(pages).Time);
+        Assert.Equal(pages, cached);
+        Assert.Contains("-hwaccel cuda -xerror ", Assert.Single(logger.Processes, process => process.Contains("rawvideo", StringComparison.Ordinal)), StringComparison.Ordinal);
+    }
+
+    /// <summary>
+    /// A hardware run that exits nonzero, hangs past the scan timeout, or exits 0 after ending a
+    /// frame early, is thrown away with the page it wrote, and the scan decodes once more in
+    /// software. Only the software page is cached, so the second scan reads it without starting
+    /// ffmpeg.
+    /// </summary>
+    [Theory]
+    [InlineData("exits 1")]
+    [InlineData("hangs")]
+    [InlineData("ends a frame early")]
+    public async Task KeyframeScan_DecodesInSoftwareAfterAFailedHardwareRun(string failure)
+    {
+        using var scope = new CachingPluginScope();
+        scope.Config.UseHardwareDecoding = true;
+        scope.Config.ScanTimeoutSeconds = 2;
+        using var ffmpeg = new FakeFfmpegScript(
+            PageLog(1000),
+            Frame,
+            probe: ProbeLog("h264", "yuv420p"),
+            hardwareLog: PageLog(2000),
+            hardwareFrames: failure == "ends a frame early" ? Frame[..6] : Frame,
+            hardwareHangs: failure == "hangs",
+            hardwareExitCode: failure == "ends a frame early" ? 0 : 1);
+        var episode = FailedRunEpisode();
+        var logger = new ScanLogger();
+        var service = scope.CreateFFmpegService(logger, NvencEncoding());
+
+        var pages = await service.ScanKeyframesAsync(episode, scope.Config);
+        var cached = await service.ScanKeyframesAsync(episode, scope.Config);
+
+        Assert.Equal(1.0, Assert.Single(pages).Time);
+        Assert.Equal(pages, cached);
+        Assert.Collection(
+            logger.Processes.Where(process => process.Contains("rawvideo", StringComparison.Ordinal)),
+            hardware => Assert.Contains("-hwaccel cuda -xerror ", hardware, StringComparison.Ordinal),
+            software => Assert.DoesNotContain("-hwaccel", software, StringComparison.Ordinal));
+    }
+
+    /// <summary>
+    /// The recap black-frame scan follows the same rule: the frame of the failed hardware run is
+    /// dropped, and the software run's frame is used and cached even though it exits nonzero.
+    /// </summary>
+    [Fact]
+    public async Task RecapBlackFrameScan_DecodesInSoftwareAfterAFailedHardwareRun()
+    {
+        using var scope = new CachingPluginScope();
+        scope.Config.UseHardwareDecoding = true;
+        using var ffmpeg = new FakeFfmpegScript(BlackFrameLog("1.000000"), [], probe: ProbeLog("hevc", "yuv420p"), hardwareLog: BlackFrameLog("2.000000"));
+        var episode = FailedRunEpisode();
+        var logger = new ScanLogger();
+        var service = scope.CreateFFmpegService(logger, NvencEncoding());
+
+        var frames = await service.DetectBlackFramesAsync(episode, new TimeRange(0, 30), 0, AnalysisMode.Recap, scope.Config);
+        var cached = await service.DetectBlackFramesAsync(episode, new TimeRange(0, 30), 0, AnalysisMode.Recap, scope.Config);
+
+        Assert.Equal(1.0, Assert.Single(frames).Time);
+        Assert.Equal(frames, cached);
+        Assert.Collection(
+            logger.Processes.Where(process => process.Contains("blackframe", StringComparison.Ordinal)),
+            hardware => Assert.Contains("-hwaccel cuda -xerror ", hardware, StringComparison.Ordinal),
+            software => Assert.DoesNotContain("-hwaccel", software, StringComparison.Ordinal));
+    }
+
+    /// <summary>
+    /// Hardware returns a 10-bit 4:2:0 frame as p010, which a plain conversion to yuv420p dithers
+    /// unlike software's yuv420p10le, so a hardware run on such a source converts through
+    /// yuv420p10le first. Other sources, and every software run, convert directly.
+    /// </summary>
+    [Theory]
+    [InlineData("yuv420p10le", "-vf format=yuv420p10le,format=yuv420p,showinfo")]
+    [InlineData("yuv420p", "-vf format=yuv420p,showinfo")]
+    public async Task KeyframeScan_ConvertsA10BitHardwareFrameThrough10BitFirst(string pixelFormat, string hardwareFilters)
+    {
+        using var scope = new CachingPluginScope();
+        scope.Config.UseHardwareDecoding = true;
+        using var ffmpeg = new FakeFfmpegScript(string.Empty, [], probe: ProbeLog("hevc", pixelFormat));
+        var logger = new ScanLogger();
+
+        await scope.CreateFFmpegService(logger, NvencEncoding()).ScanKeyframesAsync(FailedRunEpisode(), scope.Config);
+
+        Assert.Collection(
+            logger.Processes.Where(process => process.Contains("rawvideo", StringComparison.Ordinal)),
+            hardware => Assert.Contains(hardwareFilters, hardware, StringComparison.Ordinal),
+            software => Assert.Contains("-vf format=yuv420p,showinfo", software, StringComparison.Ordinal));
+    }
+
+    private static QueuedEpisode FailedRunEpisode() => new() { EpisodeId = Guid.NewGuid(), Path = "episode.mkv", Duration = 330, CreditsFingerprintStart = 5, CreditsFingerprintEnd = 35 };
+
+    private static Task RunScan(FFmpegService service, string scan, QueuedEpisode episode, PluginConfiguration config) => scan switch
+    {
+        "keyframes" => service.ScanKeyframesAsync(episode, config),
+        "recap" => service.DetectBlackFramesAsync(episode, new TimeRange(0, 30), 0, AnalysisMode.Recap, config),
+        "intervals" => service.DetectBlackIntervalsAsync(episode, new TimeRange(5, 35), 85, config),
+        "legacy" => service.DetectBlackFramesAsync(episode, new TimeRange(5, 35), 85, AnalysisMode.Credits, config),
+        "keyframe times" => service.DetectKeyFramesAsync(episode, new TimeRange(5, 35), AnalysisMode.Credits, config),
+        "cut" => service.DecodeCutWindowAsync(episode, new TimeRange(5, 10)),
+        _ => service.DetectSilenceAsync(episode, new TimeRange(0, 30), AnalysisMode.Introduction, config),
+    };
+
+    // Past the probe's 1 MiB capture, with no stream mapping before the cut.
+    private static string ProbePastTheCap => string.Concat(Enumerable.Repeat(new string('x', 99) + "\n", 12000));
+
+    // A server whose playback decodes H.264 and HEVC through NVENC, which scans take as CUDA on
+    // every platform the tests run on. The fake ffmpeg below only reads the arguments, so no test
+    // decodes on a GPU.
+    private static EncodingOptions NvencEncoding() => new() { HardwareAccelerationType = HardwareAccelerationType.nvenc, HardwareDecodingCodecs = ["h264", "hevc"] };
+
+    // The input dump and stream mapping of the codec probe on a file with one video stream.
+    private static string ProbeLog(string codec, string pixelFormat) => $"""
+        Input #0, matroska,webm, from 'episode.mkv':
+          Stream #0:0: Video: {codec} (Main), {pixelFormat}(tv, progressive), 4x2, 25 fps, 25 tbr, 1k tbn
+        Stream mapping:
+          Stream #0:0 -> #0:0 ({codec} (native) -> wrapped_avframe (native))
+
+        """;
+
+    // The showinfo header of one 4x2 keyframe at pts milliseconds, and the frame it announces.
+    private static string PageLog(int pts) => $"[showinfo@TOKEN @ 0x1] config in time_base: 1/1000, frame_rate: 25/1\n[showinfo@TOKEN @ 0x1] n:   0 pts:   {pts} pts_time:{pts / 1000} fmt:yuv420p cl:left sar:1/1 s:4x2 i:P iskey:1 type:I \n";
+
+    private static byte[] Frame => [.. Enumerable.Repeat((byte)16, 8), .. Enumerable.Repeat((byte)128, 4)];
+
+    // blackframe's line for one black frame at time t.
+    private static string BlackFrameLog(string time) => $"[blackframe@TOKEN @ 0x1] frame:0 pblack:100 pts:1 t:{time} type:I last_keyframe:0\n";
 
     // A 6 s VP9 mkv with a keyframe every 2 s and tagCount global tags of 100 bytes each.
     private static async Task<string> CreateTaggedVp9Async(int tagCount)
@@ -789,6 +1386,78 @@ public sealed class TestCacheOperations
         }
 
         return path;
+    }
+
+    // Stands in for ffmpeg in the scoped plugin, for the ways a real one fails that no file provokes.
+    // The codec probe logs probe, which by default names no video stream, and exits 0, or first
+    // sleeps for 20 s when probeHangs. A hardware run writes hardwareLog and hardwareFrames, then
+    // exits hardwareExitCode, or first sleeps for 20 s when hardwareHangs. Any other run writes the
+    // log, then the frames, then exits 3, or first sleeps for 20 s when it hangs. TOKEN in a log
+    // stands for the token of the filter instance in the run's arguments, showinfo@token or
+    // blackframe@token.
+    private sealed class FakeFfmpegScript : IDisposable
+    {
+        private readonly DirectoryInfo _directory = Directory.CreateTempSubdirectory("IntroSkipper.Tests.");
+
+        public FakeFfmpegScript(string log, byte[] frames, bool hangs = false, string probe = "", string hardwareLog = "", byte[]? hardwareFrames = null, bool hardwareHangs = false, int hardwareExitCode = 1, bool probeHangs = false)
+        {
+            var logPath = Write("log", log);
+            var framesPath = Write("frames", frames);
+            var probePath = Write("probe", probe);
+            var hardwareLogPath = Write("hardware-log", hardwareLog);
+            var hardwareFramesPath = Write("hardware-frames", hardwareFrames ?? []);
+
+            var script = Path.Join(_directory.FullName, OperatingSystem.IsWindows() ? "ffmpeg.cmd" : "ffmpeg");
+            if (OperatingSystem.IsWindows())
+            {
+                const string Sleep = "ping -n 21 127.0.0.1 >nul";
+                static string Log(string path) => $"(for /f \"usebackq delims=\" %%l in (\"{path}\") do (set \"line=%%l\" & echo !line:TOKEN=%token%!)) 1>&2";
+                File.WriteAllLines(script, [
+                    "@echo off",
+                    "setlocal enabledelayedexpansion",
+                    $"echo %* | findstr /c:\"-frames:v 0\" >nul && (type \"{probePath}\" 1>&2 {(probeHangs ? "& " + Sleep + " " : string.Empty)}& exit /b 0)",
+                    "set \"token=%*\"",
+                    "set \"token=!token:*showinfo@=!\"",
+                    "set \"token=!token:*blackframe@=!\"",
+                    "for /f \"delims==\" %%t in (\"!token!\") do set \"token=%%t\"",
+                    $"echo %* | findstr /c:\"-hwaccel\" >nul && ({Log(hardwareLogPath)} & type \"{hardwareFramesPath}\" {(hardwareHangs ? "& " + Sleep + " " : string.Empty)}& exit /b {hardwareExitCode})",
+                    Log(logPath),
+                    $"type \"{framesPath}\"",
+                    .. hangs ? [Sleep] : Array.Empty<string>(),
+                    "exit /b 3"]);
+            }
+            else
+            {
+                File.WriteAllLines(script, [
+                    "#!/bin/sh",
+                    $"case \"$*\" in *-frames:v*) cat '{probePath}' >&2; {(probeHangs ? "sleep 20; " : string.Empty)}exit 0 ;; esac",
+                    @"token=$(printf '%s' ""$*"" | sed -n 's/.*showinfo@\([A-Za-z0-9]*\).*/\1/p;s/.*blackframe@\([A-Za-z0-9]*\).*/\1/p')",
+                    $"case \"$*\" in *-hwaccel*) sed \"s/TOKEN/$token/g\" '{hardwareLogPath}' >&2; cat '{hardwareFramesPath}'; {(hardwareHangs ? "sleep 20; " : string.Empty)}exit {hardwareExitCode} ;; esac",
+                    $"sed \"s/TOKEN/$token/g\" '{logPath}' >&2",
+                    $"cat '{framesPath}'",
+                    .. hangs ? ["sleep 20"] : Array.Empty<string>(),
+                    "exit 3"]);
+                File.SetUnixFileMode(script, UnixFileMode.UserRead | UnixFileMode.UserWrite | UnixFileMode.UserExecute);
+            }
+
+            EntrypointTestHelpers.UseFFmpegAt(script);
+        }
+
+        public void Dispose() => _directory.Delete(recursive: true);
+
+        private string Write(string name, string text)
+        {
+            var path = Path.Join(_directory.FullName, name);
+            File.WriteAllText(path, text);
+            return path;
+        }
+
+        private string Write(string name, byte[] bytes)
+        {
+            var path = Path.Join(_directory.FullName, name);
+            File.WriteAllBytes(path, bytes);
+            return path;
+        }
     }
 
     // Records the detection scans FFmpegService logs, and the processes its runner starts.
@@ -822,6 +1491,43 @@ public sealed class TestCacheOperations
         }
     }
 
+    // Jellyfin's ffmpeg support list, for the hardware gate. Only SupportsHwaccel is called.
+    private class FakeMediaEncoder : DispatchProxy
+    {
+        private string[] _supported = [];
+
+        public static IMediaEncoder Create(string[] supported)
+        {
+            var proxy = Create<IMediaEncoder, FakeMediaEncoder>();
+            ((FakeMediaEncoder)(object)proxy)._supported = supported;
+            return proxy;
+        }
+
+        protected override object? Invoke(MethodInfo? targetMethod, object?[]? args)
+            => targetMethod?.Name == nameof(IMediaEncoder.SupportsHwaccel)
+                ? _supported.Contains((string)args![0]!)
+                : throw new NotImplementedException(targetMethod?.Name);
+    }
+
+    // One session per transcoding info given, null being a session that plays directly. Only
+    // Sessions is read.
+    private class FakeSessionManager : DispatchProxy
+    {
+        private SessionInfo[] _sessions = [];
+
+        public static ISessionManager Create(params TranscodingInfo?[] transcodes)
+        {
+            var proxy = Create<ISessionManager, FakeSessionManager>();
+            ((FakeSessionManager)(object)proxy)._sessions = [.. transcodes.Select(transcode => new SessionInfo(proxy, NullLogger.Instance) { TranscodingInfo = transcode! })];
+            return proxy;
+        }
+
+        protected override object? Invoke(MethodInfo? targetMethod, object?[]? args)
+            => targetMethod?.Name == $"get_{nameof(ISessionManager.Sessions)}"
+                ? _sessions
+                : throw new NotImplementedException(targetMethod?.Name);
+    }
+
     /// <summary>
     /// A plugin instance with fingerprint caching enabled over a fresh cache database,
     /// plus the cache facade and service the ffmpeg service reads through.
@@ -846,7 +1552,8 @@ public sealed class TestCacheOperations
 
         public string CacheDbPath => _inner.CacheDbPath;
 
-        public FFmpegService CreateFFmpegService(ILogger<FFmpegService>? logger = null) => new(logger ?? NullLogger<FFmpegService>.Instance, CacheService);
+        public FFmpegService CreateFFmpegService(ILogger<FFmpegService>? logger = null, EncodingOptions? encoding = null, IMediaEncoder? mediaEncoder = null, ISessionManager? sessionManager = null)
+            => new(logger ?? NullLogger<FFmpegService>.Instance, CacheService, null, null, encoding is null ? null : () => encoding, mediaEncoder, sessionManager);
 
         /// <summary>
         /// The hash a release without audio stream selection wrote on this configuration's
