@@ -14,6 +14,7 @@ using IntroSkipper.SegmentChanges;
 using IntroSkipper.Services;
 using MediaBrowser.Common.Configuration;
 using MediaBrowser.Controller;
+using MediaBrowser.Controller.Library;
 using MediaBrowser.Controller.MediaSegments;
 using MediaBrowser.Controller.Plugins;
 using Microsoft.AspNetCore.Mvc;
@@ -73,6 +74,7 @@ namespace IntroSkipper
             // pacing and rate-limit cool-down span every analysis run.
             serviceCollection.AddSingleton<ICommunitySource, IntroDbSource>();
             serviceCollection.AddSingleton<ICommunitySource, TheIntroDbSource>();
+            serviceCollection.AddSingleton<ICommunitySource, AniSkipSource>();
             serviceCollection.AddSingleton<IFFmpegService, FFmpegService>();
             // Shared plugin-to-Jellyfin segment conversion plus the direct writer into
             // Jellyfin's MediaSegments table; the provider stays registered so
@@ -82,6 +84,7 @@ namespace IntroSkipper
             // Every plugin write into Jellyfin's MediaSegments table goes through the
             // mirror: journaled validated deletes and item syncs, driven by the
             // projection worker.
+            serviceCollection.AddSingleton<EdlFileWriter>();
             serviceCollection.AddSingleton<MediaSegmentMirror>();
             serviceCollection.AddSingleton<IMediaSegmentProvider, SegmentProvider>();
             // Live view of the mirroring flag plus its toggle event; hosted so it can
@@ -104,6 +107,10 @@ namespace IntroSkipper
             serviceCollection.AddSingleton<IHostedService>(serviceProvider => serviceProvider.GetRequiredService<SegmentChange>());
             serviceCollection.AddSingleton<ISegmentEraser, SegmentEraser>();
             serviceCollection.AddSingleton<MediaSegmentsFirstEpisodeFilter>();
+            serviceCollection.AddSingleton(serviceProvider => new PlaybackCommunityFallbackFilter(
+                serviceProvider.GetRequiredService<ILibraryManager>(),
+                serviceProvider,
+                serviceProvider.GetRequiredService<ILogger<PlaybackCommunityFallbackFilter>>()));
             serviceCollection.AddSingleton<PlaybackOutroTailFilter>();
             serviceCollection.AddSingleton<PlaybackIntroOffsetFilter>();
             serviceCollection.Configure<MvcOptions>(options =>

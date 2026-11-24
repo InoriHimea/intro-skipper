@@ -99,6 +99,7 @@ public class PluginConfiguration : BasePluginConfiguration
 
     private string? _firstEpisodeIntroMode;
     private int _settledSeasonChromaprintConsensusEpisodes = DefaultSettledSeasonChromaprintConsensusEpisodes;
+    private int _libraryQuietPeriodSeconds = 60;
 
     /// <summary>
     /// Initializes a new instance of the <see cref="PluginConfiguration"/> class.
@@ -130,6 +131,16 @@ public class PluginConfiguration : BasePluginConfiguration
     /// Gets or sets a value indicating whether to automatically scan newly added items.
     /// </summary>
     public bool AutoDetectIntros { get; set; } = true;
+
+    /// <summary>
+    /// Gets or sets the seconds changed items wait after the most recent library change before
+    /// their analysis pass starts, clamped to 5–300. Never changes detection output or its hash.
+    /// </summary>
+    public int LibraryQuietPeriodSeconds
+    {
+        get => _libraryQuietPeriodSeconds;
+        set => _libraryQuietPeriodSeconds = Math.Clamp(value, 5, 300);
+    }
 
     /// <summary>
     /// Gets or sets a value indicating whether a whole season should be re-analyzed once it stops
@@ -611,6 +622,40 @@ public class PluginConfiguration : BasePluginConfiguration
     public bool IncludeCreditsEndOffsetWhenSnapping { get; set; }
 
     /// <summary>
+    /// Gets or sets the seconds the native playback API keeps at the end of the media outside
+    /// any Outro. Negative inherits <see cref="IntroEndOffset"/>; zero disables the tail
+    /// protection. Playback-only: it never changes detection output or its hash.
+    /// </summary>
+    /// <value>The tail seconds. The default is -1, which inherits <see cref="IntroEndOffset"/>.</value>
+    public int OutroTailBufferSeconds { get; set; } = -1;
+
+    /// <summary>
+    /// Gets or sets a value indicating whether the playback response applies
+    /// <see cref="CreditsStartOffset"/> and <see cref="CreditsEndOffset"/> to Outro rows another
+    /// provider wrote. Intro Skipper's own rows already carry those offsets and are never touched.
+    /// </summary>
+    public bool ApplyOffsetsToForeignOutro { get; set; } = true;
+
+    /// <summary>
+    /// Gets or sets a value indicating whether Intro Skipper writes and maintains a sidecar
+    /// <c>.edl</c> next to each media file whenever its segments are projected.
+    /// </summary>
+    public bool WriteEdlOnSegmentChange { get; set; }
+
+    /// <summary>
+    /// Gets or sets a value indicating whether the written <c>.edl</c> keeps the
+    /// <see cref="EffectiveOutroTailBufferSeconds"/> tail outside every Outro.
+    /// </summary>
+    public bool ApplyOutroTailBufferToEdl { get; set; } = true;
+
+    /// <summary>
+    /// Gets the tail seconds playback protection uses: <see cref="OutroTailBufferSeconds"/> when
+    /// it is not negative, otherwise <see cref="IntroEndOffset"/>.
+    /// </summary>
+    [XmlIgnore]
+    public int EffectiveOutroTailBufferSeconds => OutroTailBufferSeconds >= 0 ? OutroTailBufferSeconds : IntroEndOffset;
+
+    /// <summary>
     /// Gets or sets the amount of intro at start to play (in seconds).
     /// </summary>
     public int IntroStartOffset { get; set; }
@@ -636,6 +681,13 @@ public class PluginConfiguration : BasePluginConfiguration
     public bool EnableCommunityFallback { get; set; }
 
     /// <summary>
+    /// Gets or sets a value indicating whether a native playback segment request for an item that
+    /// has not been analyzed yet queries the enabled community sources on demand with a short
+    /// timeout and returns any match with the configured offsets and outro tail buffer.
+    /// </summary>
+    public bool EnableOnDemandPlaybackCommunityLookup { get; set; } = true;
+
+    /// <summary>
     /// Gets or sets a value indicating whether IntroDB (introdb.app) is queried by the community fallback.
     /// </summary>
     public bool CommunityUseIntroDb { get; set; } = true;
@@ -644,6 +696,20 @@ public class PluginConfiguration : BasePluginConfiguration
     /// Gets or sets a value indicating whether TheIntroDB (theintrodb.org) is queried by the community fallback.
     /// </summary>
     public bool CommunityUseTheIntroDb { get; set; } = true;
+
+    /// <summary>
+    /// Gets or sets a value indicating whether AniSkip (aniskip.com), the anime-focused community
+    /// database, is queried by the community fallback after the other sources.
+    /// </summary>
+    public bool CommunityUseAniSkip { get; set; } = true;
+
+    /// <summary>
+    /// Gets or sets for how many days after an item was added the community fallback re-queries
+    /// an episode that earlier lookups left without a segment, at most every 12 hours, so a
+    /// new release that the databases lacked on day one is filled once they have it. Zero
+    /// disables the retry. Never changes detection output or its hash.
+    /// </summary>
+    public int CommunityRetryNoSegmentsDays { get; set; } = 7;
 
     /// <summary>
     /// Gets or sets how many seconds a community timestamp set may disagree with the local file:

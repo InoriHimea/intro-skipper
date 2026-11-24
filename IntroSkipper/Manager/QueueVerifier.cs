@@ -2,6 +2,7 @@
 // SPDX-FileCopyrightText: 2026 AbandonedCart
 // SPDX-License-Identifier: GPL-3.0-only
 
+using IntroSkipper.Community;
 using IntroSkipper.Configuration;
 using IntroSkipper.Data;
 using IntroSkipper.Helper;
@@ -14,7 +15,9 @@ namespace IntroSkipper.Manager;
 /// analysis record under the current configuration hash settles an episode for the
 /// mode (<see cref="EpisodeState.Analyzed"/> with segments,
 /// <see cref="EpisodeState.NoSegments"/> without), user segments always settle it, and
-/// anything else stays <see cref="EpisodeState.NotAnalyzed"/>. A record whose file
+/// anything else stays <see cref="EpisodeState.NotAnalyzed"/>. A settled "no segment" of a recently
+/// added episode stays open when <see cref="Community.CommunityRetry"/> says its community lookup
+/// is due again. A record whose file
 /// version differs from the episode's current one no longer describes the file: the
 /// episode is flagged <see cref="QueuedEpisode.FileChanged"/> and stays open. A record
 /// under the hash the current settings produce for the other chapter source settles the
@@ -25,6 +28,7 @@ namespace IntroSkipper.Manager;
 /// </summary>
 internal sealed partial class QueueVerifier
 {
+    private readonly TimeProvider _timeProvider;
     private readonly PluginConfiguration _config;
     private readonly IReadOnlyCollection<AnalysisMode> _modes;
     private readonly SeasonQueueSnapshot _snapshot;
@@ -65,6 +69,7 @@ internal sealed partial class QueueVerifier
     /// <param name="previewFromCreditsEndOverride">Optional season-level setting for deriving a Preview segment from Credits.</param>
     /// <param name="subtitleRecapDetectionOverride">Optional season-level setting for subtitle recap detection.</param>
     /// <param name="subtitlePreviewDetectionOverride">Optional season-level setting for subtitle preview detection.</param>
+    /// <param name="timeProvider">Clock for the community retry window; defaults to the system clock.</param>
     public QueueVerifier(
         PluginConfiguration config,
         IReadOnlyCollection<AnalysisMode> modes,
@@ -74,8 +79,10 @@ internal sealed partial class QueueVerifier
         int? analysisLengthLimitOverride = null,
         bool? previewFromCreditsEndOverride = null,
         bool? subtitleRecapDetectionOverride = null,
-        bool? subtitlePreviewDetectionOverride = null)
+        bool? subtitlePreviewDetectionOverride = null,
+        TimeProvider? timeProvider = null)
     {
+        _timeProvider = timeProvider ?? TimeProvider.System;
         _config = config;
         _modes = modes;
         _snapshot = snapshot;
@@ -185,7 +192,7 @@ internal sealed partial class QueueVerifier
                     candidate.SetAnalyzed(mode, isUserProvided ? EpisodeState.UserProvided : EpisodeState.Analyzed);
                 }
             }
-            else if (settled)
+            else if (settled && !CommunityRetry.ShouldReopen(_config, candidate, mode, _timeProvider.GetUtcNow()))
             {
                 candidate.SetAnalyzed(mode, EpisodeState.NoSegments);
             }

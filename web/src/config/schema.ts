@@ -16,6 +16,15 @@ export const configSchema = {
         description:
             'If enabled, new media will be automatically analyzed for skippable segments when added to the library<br/><br/>Note: To configure the scheduled task, see <a href="#/dashboard/tasks">scheduled tasks</a>.',
     },
+    LibraryQuietPeriodSeconds: {
+        kind: "number",
+        label: "Library change quiet period (seconds)",
+        min: 5,
+        max: 300,
+        step: 1,
+        description:
+            "Default: 60. Seconds to wait after the most recent library change before starting analysis (5–300). Lower values start analyzing newly added single episodes sooner.",
+    },
     ReanalyzeSettledSeasons: {
         kind: "checkbox",
         label: "Re-analyze settled seasons",
@@ -132,6 +141,12 @@ export const configSchema = {
         label: "Fill missing intros and credits from community databases",
         description: "Ask the enabled databases below for items local analysis found nothing for.",
     },
+    EnableOnDemandPlaybackCommunityLookup: {
+        kind: "checkbox",
+        label: "On-demand community lookup on first playback",
+        description:
+            "When an unanalyzed item is played before background analysis finishes, query enabled community databases with a 1.5 s timeout and return matching segments with configured offsets and outro tail protection.",
+    },
     CommunityUseIntroDb: {
         kind: "checkbox",
         label: "IntroDB (introdb.app)",
@@ -142,6 +157,21 @@ export const configSchema = {
         label: "TheIntroDB (theintrodb.org)",
         description:
             "Anonymous lookups by TVDB, TMDB or IMDb id, limited by the service to 5000 per day. Asked after IntroDB.",
+    },
+    CommunityUseAniSkip: {
+        kind: "checkbox",
+        label: "AniSkip (aniskip.com)",
+        description:
+            "Anime-focused database, asked after the others. Needs a MyAnimeList id on the series (set by anime metadata plugins), or maps the TVDB, TMDB or IMDb id to one through arm.haglund.dev; a mapped id is only used for season 1 and movies.",
+    },
+    CommunityRetryNoSegmentsDays: {
+        kind: "number",
+        label: "Retry empty lookups for new items (days)",
+        min: 0,
+        max: 60,
+        step: 1,
+        description:
+            "Default: 7. For this many days after an item was added, an episode the community databases had nothing for is asked again at most every 12 hours, so new releases get timestamps once they are published. 0 disables the retry. Does not trigger re-analysis of other items.",
     },
     CommunityDurationToleranceSeconds: {
         kind: "number",
@@ -382,6 +412,33 @@ export const configSchema = {
         label: "Include credits offset when snapping to episode end",
         description:
             "When enabled, Credits End Offset is also applied when the detected credits end is snapped to the end of the episode.",
+    },
+
+    OutroTailBufferSeconds: {
+        kind: "number",
+        label: "Outro tail buffer (seconds)",
+        min: -1,
+        step: 1,
+        description:
+            "Playback only. Seconds kept at the end of the media outside any Outro, so skipping never jumps to the very last frame. -1 (default) uses Intro End Offset; 0 disables the protection. Changing it never triggers re-analysis.",
+    },
+    ApplyOffsetsToForeignOutro: {
+        kind: "checkbox",
+        label: "Apply credits offsets to other providers' Outro segments",
+        description:
+            "Playback only. When enabled, Credits Start Offset and Credits End Offset are also applied to Outro segments written by other providers. Intro Skipper's own segments are never adjusted twice.",
+    },
+    WriteEdlOnSegmentChange: {
+        kind: "checkbox",
+        label: "Write .edl files next to media",
+        description:
+            "When enabled, Intro Skipper writes and keeps a sidecar .edl file for each item whenever its segments change, for players that read EDL files. It overwrites an existing .edl of the same name, but only removes files it wrote itself. Requires 'Update Missing Segments During Scan'.",
+    },
+    ApplyOutroTailBufferToEdl: {
+        kind: "checkbox",
+        label: "Keep the outro tail buffer in .edl files",
+        description:
+            "When enabled, written .edl files end every Outro at least the outro tail buffer before the end of the media, like the playback API.",
     },
 
     // Black frame

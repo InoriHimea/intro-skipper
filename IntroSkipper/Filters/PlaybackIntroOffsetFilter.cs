@@ -59,7 +59,7 @@ internal sealed partial class PlaybackIntroOffsetFilter(
         if ((statusCode ?? context.HttpContext.Response.StatusCode) != StatusCodes.Status200OK ||
             value is not QueryResult<MediaSegmentDto> segments ||
             segments.Items is null ||
-            !segments.Items.Any(segment => segment.Type == MediaSegmentType.Intro) ||
+            !segments.Items.Any(segment => IsAdjustable(segment.Type, offsets)) ||
             !context.RouteData.Values.TryGetValue("itemId", out var routeItemId) ||
             !Guid.TryParse(routeItemId?.ToString(), out var itemId) ||
             itemId == Guid.Empty)
@@ -71,7 +71,16 @@ internal sealed partial class PlaybackIntroOffsetFilter(
         IReadOnlySet<Guid> foreignIds;
         try
         {
-            foreignIds = await _segmentStore.GetForeignSegmentIdsAsync(itemId, MediaSegmentType.Intro, context.HttpContext.RequestAborted).ConfigureAwait(false);
+            var ids = new HashSet<Guid>();
+            foreach (var type in new[] { MediaSegmentType.Intro, MediaSegmentType.Outro })
+            {
+                if (IsAdjustable(type, offsets) && segments.Items.Any(segment => segment.Type == type))
+                {
+                    ids.UnionWith(await _segmentStore.GetForeignSegmentIdsAsync(itemId, type, context.HttpContext.RequestAborted).ConfigureAwait(false));
+                }
+            }
+
+            foreignIds = ids;
         }
         catch (OperationCanceledException)
         {
@@ -128,9 +137,11 @@ internal sealed partial class PlaybackIntroOffsetFilter(
         var removed = 0;
         foreach (var segment in segments.Items)
         {
-            var adjusted = segment.Type == MediaSegmentType.Intro && foreignIds.Contains(segment.Id)
-                ? AdjustIntro(segment, durationTicks, offsets)
-                : segment;
+            var adjusted = !foreignIds.Contains(segment.Id) || !IsAdjustable(segment.Type, offsets)
+                ? segment
+                : segment.Type == MediaSegmentType.Intro
+                    ? AdjustIntro(segment, durationTicks, offsets)
+                    : AdjustOutro(segment, durationTicks, offsets);
             changed |= !ReferenceEquals(segment, adjusted);
             if (adjusted is null)
             {
@@ -195,6 +206,64 @@ internal sealed partial class PlaybackIntroOffsetFilter(
                 EndTicks = endTicks
             };
     }
+
+    /// <summary>
+    /// Applies one foreign Outro row's credits offsets the way analysis applies them: the
+    /// start takes the start offset, the end loses the end offset. An end within the snap
+    /// threshold of the media end counts as snapped and only takes the end offset when
+    /// opted in. Unlike analysis, the end never moves later, so a foreign skip never grows.
+    /// Intro Skipper's own rows never reach this method. The playback tail protection runs
+    /// afterwards and caps whatever end results.
+    /// </summary>
+    /// <param name="segment">Original foreign Outro row.</param>
+    /// <param name="durationTicks">Media duration; non-positive when unknown.</param>
+    /// <param name="offsets">Configured playback offsets.</param>
+    /// <returns>The original row when unchanged, an adjusted copy, or null when no skip range remains.</returns>
+    internal static MediaSegmentDto? AdjustOutro(MediaSegmentDto segment, long? durationTicks, PlaybackIntroOffsets offsets)
+    {
+        var known = durationTicks is > 0;
+        var maximum = known ? durationTicks!.Value : long.MaxValue;
+        var endOffsetTicks = SecondsToTicks(offsets.CreditsEndSeconds);
+        var startTicks = Math.Clamp(AddClamped(segment.StartTicks, SecondsToTicks(offsets.CreditsStartSeconds)), 0, maximum);
+
+        long endTicks;
+        if (known && segment.EndTicks >= maximum - SecondsToTicks(offsets.EndSnapThresholdSeconds))
+        {
+            endTicks = offsets.IncludeCreditsEndOffsetWhenSnapping
+                ? Math.Min(segment.EndTicks, Math.Clamp(maximum - endOffsetTicks, 0, maximum))
+                : segment.EndTicks;
+        }
+        else
+        {
+            endTicks = segment.EndTicks - endOffsetTicks;
+        }
+
+        endTicks = Math.Clamp(endTicks, 0, maximum);
+        if (endTicks <= startTicks)
+        {
+            return null;
+        }
+
+        return startTicks == segment.StartTicks && endTicks == segment.EndTicks
+            ? segment
+            : new MediaSegmentDto
+            {
+                Id = segment.Id,
+                ItemId = segment.ItemId,
+                Type = segment.Type,
+                StartTicks = startTicks,
+                EndTicks = endTicks
+            };
+    }
+
+    private static bool IsAdjustable(MediaSegmentType type, PlaybackIntroOffsets offsets) => type switch
+    {
+        MediaSegmentType.Intro => offsets.HasIntroOffsets,
+        MediaSegmentType.Outro => offsets.HasOutroOffsets,
+        _ => false
+    };
+
+    private static long SecondsToTicks(double seconds) => (long)Math.Round(seconds * TimeSpan.TicksPerSecond);
 
     private static long AddClamped(long ticks, long delta) => ticks > long.MaxValue - delta ? long.MaxValue : ticks + delta;
 

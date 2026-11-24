@@ -103,6 +103,11 @@ public sealed partial class AnalysisScheduler(
         }
     }
 
+    private static TimeSpan CurrentQuietPeriod
+        => Plugin.Instance?.Configuration is { } config
+            ? TimeSpan.FromSeconds(config.LibraryQuietPeriodSeconds)
+            : QuietPeriod;
+
     /// <summary>
     /// Returns the state of the key's manual scan: whether one is pending or running, and
     /// whether the most recent completed one failed.
@@ -365,7 +370,7 @@ public sealed partial class AnalysisScheduler(
             return (null, null);
         }
 
-        var due = _lastChange + QuietPeriod;
+        var due = _lastChange + CurrentQuietPeriod;
         if (_timeProvider.GetUtcNow() < due)
         {
             return (null, due);

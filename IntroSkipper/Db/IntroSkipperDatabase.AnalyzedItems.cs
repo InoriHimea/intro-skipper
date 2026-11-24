@@ -130,6 +130,29 @@ public sealed partial class IntroSkipperDatabase
     }
 
     /// <summary>
+    /// Returns whether an item is eligible for an on-demand playback community lookup:
+    /// it is not disabled, has no analysis record for <see cref="AnalysisMode.Introduction"/>
+    /// or <see cref="AnalysisMode.Credits"/>, and has no stored segment or tombstone for
+    /// either mode.
+    /// </summary>
+    /// <param name="itemId">Item ID.</param>
+    /// <param name="cancellationToken">Cancellation token.</param>
+    /// <returns><see langword="true"/> when the item has not been analyzed and carries no user or suppressed state.</returns>
+    public async Task<bool> IsEligibleForOnDemandCommunityLookupAsync(Guid itemId, CancellationToken cancellationToken = default)
+    {
+        await InitializeAsync().ConfigureAwait(false);
+        using var db = _contextFactory.CreateDbContext();
+
+        return !await db.DisabledItems.AsNoTracking().AnyAsync(d => d.ItemId == itemId, cancellationToken).ConfigureAwait(false)
+            && !await db.AnalyzedItems.AsNoTracking().AnyAsync(
+                a => a.ItemId == itemId && (a.Type == AnalysisMode.Introduction || a.Type == AnalysisMode.Credits),
+                cancellationToken).ConfigureAwait(false)
+            && !await db.Segments.AsNoTracking().AnyAsync(
+                s => s.ItemId == itemId && (s.Type == AnalysisMode.Introduction || s.Type == AnalysisMode.Credits),
+                cancellationToken).ConfigureAwait(false);
+    }
+
+    /// <summary>
     /// Runs the chunked statements of one analysis-record write in a single transaction,
     /// so a cancelled pass cannot leave a season half-recorded.
     /// </summary>

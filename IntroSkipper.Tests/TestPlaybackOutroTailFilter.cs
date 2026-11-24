@@ -158,6 +158,25 @@ public class TestPlaybackOutroTailFilter
     }
 
     [Theory]
+    [InlineData(5, -1, 95)] // inherits IntroEndOffset
+    [InlineData(5, 8, 92)] // independent seconds win over IntroEndOffset
+    [InlineData(0, 8, 92)] // works with no intro offset at all
+    [InlineData(5, 0, 100)] // an explicit zero disables the protection
+    [InlineData(5, -7, 95)] // any negative value inherits
+    public async Task IndependentTailBufferOverridesIntroEndOffset(int introEndOffset, int tailBuffer, long expectedEnd)
+    {
+        using var scope = EntrypointTestHelpers.CreatePluginScope(new PluginConfiguration { IntroEndOffset = introEndOffset, OutroTailBufferSeconds = tailBuffer });
+        var id = Guid.NewGuid();
+        var library = EntrypointTestHelpers.CreateLibraryManager(new Episode { Id = id, RunTimeTicks = 100 * TicksPerSecond });
+        var input = new QueryResult<MediaSegmentDto>([PlaybackFilterTestHelpers.Segment(id, 10 * TicksPerSecond, 100 * TicksPerSecond)]);
+        var result = new OkObjectResult(input);
+
+        await PlaybackFilterTestHelpers.RunAsync(PlaybackFilterTestHelpers.CreateContext(id, result), new PlaybackOutroTailFilter(library));
+
+        Assert.Equal(expectedEnd * TicksPerSecond, Assert.Single(Assert.IsType<QueryResult<MediaSegmentDto>>(result.Value).Items).EndTicks);
+    }
+
+    [Theory]
     [InlineData("POST")]
     [InlineData("PUT")]
     [InlineData("DELETE")]

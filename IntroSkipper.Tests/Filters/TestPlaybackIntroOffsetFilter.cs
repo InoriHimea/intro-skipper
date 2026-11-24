@@ -331,6 +331,98 @@ public class TestPlaybackIntroOffsetFilter
         Assert.Equal(1420 * TicksPerSecond, outro.EndTicks);
     }
 
+    [Theory]
+    [InlineData(1000, 1300, 1003, 1298)] // both credits offsets apply to a mid-episode row
+    [InlineData(1000, 1419, 1003, 1419)] // within the snap threshold of the end: snapped, end offset not opted in
+    [InlineData(1000, 1420, 1003, 1420)]
+    public void ForeignOutroTakesCreditsOffsets(int startSeconds, int endSeconds, int expectedStartSeconds, int expectedEndSeconds)
+    {
+        var offsets = new PlaybackIntroOffsets(0, 0, 2.0, false, 3, 2, false, true);
+        var input = Segment(MediaSegmentType.Outro, startSeconds * TicksPerSecond, endSeconds * TicksPerSecond);
+
+        var output = PlaybackIntroOffsetFilter.AdjustOutro(input, 1420 * TicksPerSecond, offsets);
+
+        Assert.NotNull(output);
+        Assert.Equal(expectedStartSeconds * TicksPerSecond, output!.StartTicks);
+        Assert.Equal(expectedEndSeconds * TicksPerSecond, output.EndTicks);
+        Assert.Equal(endSeconds * TicksPerSecond, input.EndTicks);
+    }
+
+    [Fact]
+    public void SnappedOutroEndTakesTheEndOffsetOnlyWhenOptedInAndNeverMovesLater()
+    {
+        var optIn = new PlaybackIntroOffsets(0, 0, 2.0, false, 0, 3, true, true);
+        var snapped = Segment(MediaSegmentType.Outro, 1300 * TicksPerSecond, 1420 * TicksPerSecond);
+        Assert.Equal(1417 * TicksPerSecond, PlaybackIntroOffsetFilter.AdjustOutro(snapped, 1420 * TicksPerSecond, optIn)!.EndTicks);
+
+        var earlySnapped = Segment(MediaSegmentType.Outro, 1300 * TicksPerSecond, 1418 * TicksPerSecond);
+        Assert.Equal(1417 * TicksPerSecond, PlaybackIntroOffsetFilter.AdjustOutro(earlySnapped, 1420 * TicksPerSecond, optIn)!.EndTicks);
+
+        var smallOffset = new PlaybackIntroOffsets(0, 0, 2.0, false, 0, 1, true, true);
+        var edge = Segment(MediaSegmentType.Outro, 1300 * TicksPerSecond, 1418 * TicksPerSecond);
+        Assert.Same(edge, PlaybackIntroOffsetFilter.AdjustOutro(edge, 1420 * TicksPerSecond, new PlaybackIntroOffsets(0, 0, 2.0, false, 0, 0, true, true)));
+        Assert.Equal(1418 * TicksPerSecond, PlaybackIntroOffsetFilter.AdjustOutro(edge, 1420 * TicksPerSecond, smallOffset)!.EndTicks);
+    }
+
+    [Fact]
+    public void ForeignOutroWithUnknownDurationAndConsumedRowsBehave()
+    {
+        var offsets = new PlaybackIntroOffsets(0, 0, 2.0, false, 3, 2, false, true);
+        var input = Segment(MediaSegmentType.Outro, 1000 * TicksPerSecond, 1300 * TicksPerSecond);
+
+        var unknown = PlaybackIntroOffsetFilter.AdjustOutro(input, null, offsets);
+        Assert.Equal(1003 * TicksPerSecond, unknown!.StartTicks);
+        Assert.Equal(1298 * TicksPerSecond, unknown.EndTicks);
+
+        var consumed = Segment(MediaSegmentType.Outro, 1000 * TicksPerSecond, 1004 * TicksPerSecond);
+        Assert.Null(PlaybackIntroOffsetFilter.AdjustOutro(consumed, 1420 * TicksPerSecond, offsets));
+    }
+
+    [Fact]
+    public async Task ForeignOutroIsAdjustedThenTailProtectedWhilePluginOutroIsLeftAlone()
+    {
+        using var scope = EntrypointTestHelpers.CreatePluginScope(
+            new PluginConfiguration { CreditsStartOffset = 3, CreditsEndOffset = 2, OutroTailBufferSeconds = 5, FirstEpisodeIntroMode = PluginConfiguration.FirstEpisodeIntroModeAnalyze });
+        var itemId = Guid.NewGuid();
+        var library = EntrypointTestHelpers.CreateLibraryManager(new Episode { Id = itemId, RunTimeTicks = 1420 * TicksPerSecond });
+        var own = Segment(MediaSegmentType.Outro, 1203 * TicksPerSecond, 1418 * TicksPerSecond, itemId);
+        var foreign = Segment(MediaSegmentType.Outro, 1300 * TicksPerSecond, 1420 * TicksPerSecond, itemId);
+        var store = new FakeJellyfinSegmentStore();
+        store.ForeignSegments[foreign.Id] = foreign;
+        var result = new OkObjectResult(new QueryResult<MediaSegmentDto>([own, foreign]));
+
+        await PlaybackFilterTestHelpers.RunRegisteredFiltersAsync(PlaybackFilterTestHelpers.CreateContext(itemId, result), library, store);
+
+        var output = Assert.IsType<QueryResult<MediaSegmentDto>>(result.Value);
+        // The plugin row was never adjusted here; only the tail cap applies to it.
+        Assert.Equal(1203 * TicksPerSecond, output.Items[0].StartTicks);
+        Assert.Equal(1415 * TicksPerSecond, output.Items[0].EndTicks);
+        Assert.Equal(1303 * TicksPerSecond, output.Items[1].StartTicks);
+        Assert.Equal(1415 * TicksPerSecond, output.Items[1].EndTicks);
+        Assert.Equal(1300 * TicksPerSecond, foreign.StartTicks);
+    }
+
+    [Fact]
+    public async Task ForeignOutroOffsetsCanBeDisabled()
+    {
+        using var scope = EntrypointTestHelpers.CreatePluginScope(
+            new PluginConfiguration { CreditsStartOffset = 3, CreditsEndOffset = 2, ApplyOffsetsToForeignOutro = false });
+        var itemId = Guid.NewGuid();
+        var library = EntrypointTestHelpers.CreateLibraryManager(new Episode { Id = itemId, RunTimeTicks = 1420 * TicksPerSecond });
+        var foreign = Segment(MediaSegmentType.Outro, 1300 * TicksPerSecond, 1400 * TicksPerSecond, itemId);
+        var store = new FakeJellyfinSegmentStore();
+        store.ForeignSegments[foreign.Id] = foreign;
+        var input = new QueryResult<MediaSegmentDto>([foreign]);
+        var result = new OkObjectResult(input);
+
+        await PlaybackFilterTestHelpers.RunAsync(
+            PlaybackFilterTestHelpers.CreateContext(itemId, result),
+            new PlaybackIntroOffsetFilter(library, store, Microsoft.Extensions.Logging.Abstractions.NullLogger<PlaybackIntroOffsetFilter>.Instance));
+
+        Assert.Same(input, result.Value);
+        Assert.Equal(0, store.ForeignSegmentIdReadCount);
+    }
+
     private static MediaSegmentDto Segment(MediaSegmentType type, long startTicks, long endTicks, Guid? itemId = null)
         => PlaybackFilterTestHelpers.Segment(itemId ?? Guid.NewGuid(), startTicks, endTicks, type);
 }

@@ -163,6 +163,9 @@ export const generalTab: Tab = {
                 "ScanCommercial",
             ]),
             form.field("AutoDetectIntros"),
+            form.field("LibraryQuietPeriodSeconds", {
+                visible: () => configStore.get("AutoDetectIntros") === true,
+            }),
             form.field("ReanalyzeSettledSeasons"),
             form.field("SettledSeasonDelayHours", {
                 visible: () => configStore.get("ReanalyzeSettledSeasons") === true,

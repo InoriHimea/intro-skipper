@@ -384,8 +384,13 @@ internal static class ConfigHasher
     // CommunityHashAdoption), so local results are not recomputed.
     private static string CommunityToken(PluginConfiguration config, bool enabled)
         => enabled
-            ? FormattableString.Invariant($"|community=v1|introdb={config.CommunityUseIntroDb}|theintrodb={config.CommunityUseTheIntroDb}|tol={config.CommunityDurationToleranceSeconds}")
+            ? FormattableString.Invariant($"|community=v1|introdb={config.CommunityUseIntroDb}|theintrodb={config.CommunityUseTheIntroDb}|tol={config.CommunityDurationToleranceSeconds}{AniSkipToken(config)}")
             : string.Empty;
+
+    // AniSkip is on by default, so only turning it off leaves a mark: the hash of a configuration
+    // that has it on is the one written before the source existed, and nothing is re-analyzed on upgrade.
+    private static string AniSkipToken(PluginConfiguration config)
+        => config.CommunityUseAniSkip ? string.Empty : "|aniskip=off";
 
     // Only present when enabled so the default-off configuration keeps the hash it had before
     // the option existed. A BlackFrame action restricts the credits pass to that analyzer, which

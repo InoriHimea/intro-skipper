@@ -20,7 +20,7 @@ public class TestPlaybackFiltersConvention
         var model = PlaybackFilterTestHelpers.CreateModel(typeof(Jellyfin.Api.Controllers.MediaSegmentsController));
         new PlaybackFiltersConvention().Apply(model);
         Assert.Equal(
-            new[] { typeof(PlaybackIntroOffsetFilter), typeof(PlaybackOutroTailFilter) },
+            new[] { typeof(PlaybackCommunityFallbackFilter), typeof(PlaybackIntroOffsetFilter), typeof(PlaybackOutroTailFilter) },
             model.Controllers[0].Actions[0].Filters.OfType<ServiceFilterAttribute>().Select(filter => filter.ServiceType));
     }
 
@@ -94,7 +94,7 @@ public class TestPlaybackFiltersConvention
         var model = PlaybackFilterTestHelpers.CreateModel(typeof(Jellyfin.Api.Controllers.MediaSegmentsController));
         new MediaSegmentsFilterConvention().Apply(model);
         new PlaybackFiltersConvention().Apply(model);
-        Assert.Equal(new[] { typeof(MediaSegmentsFirstEpisodeFilter), typeof(PlaybackIntroOffsetFilter), typeof(PlaybackOutroTailFilter) },
+        Assert.Equal(new[] { typeof(MediaSegmentsFirstEpisodeFilter), typeof(PlaybackCommunityFallbackFilter), typeof(PlaybackIntroOffsetFilter), typeof(PlaybackOutroTailFilter) },
             model.Controllers[0].Actions[0].Filters.OfType<ServiceFilterAttribute>().Select(filter => filter.ServiceType));
     }
 
@@ -108,9 +108,11 @@ public class TestPlaybackFiltersConvention
         // Resolving the playback filters needs the attribution read; the production store
         // wants a server database, so the fake stands in for it here.
         services.AddSingleton<IJellyfinSegmentStore>(new FakeJellyfinSegmentStore());
+        Assert.Equal(ServiceLifetime.Singleton, Assert.Single(services, descriptor => descriptor.ServiceType == typeof(PlaybackCommunityFallbackFilter)).Lifetime);
         Assert.Equal(ServiceLifetime.Singleton, Assert.Single(services, descriptor => descriptor.ServiceType == typeof(PlaybackOutroTailFilter)).Lifetime);
         Assert.Equal(ServiceLifetime.Singleton, Assert.Single(services, descriptor => descriptor.ServiceType == typeof(PlaybackIntroOffsetFilter)).Lifetime);
         using var provider = services.BuildServiceProvider();
+        Assert.Same(provider.GetRequiredService<PlaybackCommunityFallbackFilter>(), provider.GetRequiredService<PlaybackCommunityFallbackFilter>());
         Assert.Same(provider.GetRequiredService<PlaybackOutroTailFilter>(), provider.GetRequiredService<PlaybackOutroTailFilter>());
         Assert.Same(provider.GetRequiredService<PlaybackIntroOffsetFilter>(), provider.GetRequiredService<PlaybackIntroOffsetFilter>());
         var conventions = provider.GetRequiredService<IOptions<MvcOptions>>().Value.Conventions;

@@ -19,8 +19,11 @@ export const communityTab: Tab = {
                     "<p>Lookups use the series' IMDb, TMDB and TVDB ids. Enabling or changing these settings re-checks intro and credits results once on the next scan.</p>",
             ),
             form.field("EnableCommunityFallback"),
+            form.field("EnableOnDemandPlaybackCommunityLookup", { visible: enabled }),
             form.field("CommunityUseIntroDb", { visible: enabled }),
             form.field("CommunityUseTheIntroDb", { visible: enabled }),
+            form.field("CommunityUseAniSkip", { visible: enabled }),
+            form.field("CommunityRetryNoSegmentsDays", { visible: enabled }),
             form.field("CommunityDurationToleranceSeconds", { visible: enabled }),
         );
     },

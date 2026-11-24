@@ -33,11 +33,13 @@ namespace IntroSkipper.Manager;
 /// <param name="segmentDtoFactory">The factory that converts stored plugin segments to Jellyfin DTOs.</param>
 /// <param name="policy">The mirroring flag, read before every write.</param>
 /// <param name="logger">The logger.</param>
+/// <param name="edlWriter">Optional sidecar <c>.edl</c> writer, run after each convergence.</param>
 internal sealed partial class MediaSegmentMirror(
     IJellyfinSegmentStore segmentStore,
     SegmentDtoFactory segmentDtoFactory,
     IMediaSegmentMirrorPolicy policy,
-    ILogger<MediaSegmentMirror> logger)
+    ILogger<MediaSegmentMirror> logger,
+    EdlFileWriter? edlWriter = null)
 {
     /// <summary>
     /// Finds a Jellyfin segment by id alone, any item and any provider. Reads are never
@@ -107,6 +109,9 @@ internal sealed partial class MediaSegmentMirror(
             await segmentStore.ReplaceSegmentsAsync(itemId, segments, cancellationToken).ConfigureAwait(false);
         }
 
+        // The EDL follows the same servable truth as the mirror, so it is written only once
+        // the item has converged and, like the mirror, only while mirroring is enabled.
+        edlWriter?.Sync(itemId, segments);
         return true;
     }
 

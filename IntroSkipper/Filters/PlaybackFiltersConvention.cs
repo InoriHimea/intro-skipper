@@ -6,10 +6,10 @@ using Microsoft.AspNetCore.Mvc.ApplicationModels;
 namespace IntroSkipper.Filters;
 
 /// <summary>
-/// Applies the fork's playback filters — <see cref="PlaybackOutroTailFilter"/> and
-/// <see cref="PlaybackIntroOffsetFilter"/> — to Jellyfin's native playback segment GET.
-/// Both rewrite that one response, so they share one convention and one definition of
-/// the action they may touch.
+/// Applies the fork's playback filters — <see cref="PlaybackCommunityFallbackFilter"/>,
+/// <see cref="PlaybackIntroOffsetFilter"/> and <see cref="PlaybackOutroTailFilter"/> — to
+/// Jellyfin's native playback segment GET. They rewrite that one response, so they share
+/// one convention and one definition of the action they may touch.
 /// </summary>
 internal sealed class PlaybackFiltersConvention : IApplicationModelConvention
 {
@@ -25,6 +25,7 @@ internal sealed class PlaybackFiltersConvention : IApplicationModelConvention
                     continue;
                 }
 
+                action.Filters.Add(new ServiceFilterAttribute(typeof(PlaybackCommunityFallbackFilter)));
                 action.Filters.Add(new ServiceFilterAttribute(typeof(PlaybackIntroOffsetFilter)));
                 action.Filters.Add(new ServiceFilterAttribute(typeof(PlaybackOutroTailFilter)));
             }

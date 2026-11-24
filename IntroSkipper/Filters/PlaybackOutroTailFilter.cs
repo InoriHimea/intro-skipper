@@ -23,7 +23,7 @@ public sealed class PlaybackOutroTailFilter(ILibraryManager libraryManager) : IA
     /// <inheritdoc />
     public async Task OnResultExecutionAsync(ResultExecutingContext context, ResultExecutionDelegate next)
     {
-        var keepSeconds = Plugin.Instance?.Configuration.IntroEndOffset ?? 0;
+        var keepSeconds = Plugin.Instance?.Configuration.EffectiveOutroTailBufferSeconds ?? 0;
         if (keepSeconds <= 0 ||
             !HttpMethods.IsGet(context.HttpContext.Request.Method) ||
             context.ActionDescriptor is not ControllerActionDescriptor action ||

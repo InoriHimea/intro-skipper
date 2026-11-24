@@ -50,6 +50,35 @@ internal sealed partial class CommunityFallback(
         => string.IsNullOrWhiteSpace(displayOrder) || string.Equals(displayOrder, "aired", StringComparison.OrdinalIgnoreCase);
 
     /// <summary>
+    /// Builds a <see cref="CommunityLookup"/> from a library item (<see cref="Episode"/> or movie).
+    /// </summary>
+    /// <param name="item">Episode or movie item.</param>
+    /// <param name="getItem">Lookup function resolving parent items by id.</param>
+    /// <param name="duration">Optional duration override in seconds; non-positive uses <see cref="BaseItem.RunTimeTicks"/>.</param>
+    /// <returns>The community lookup, or <see langword="null"/> when an episode's series cannot be resolved.</returns>
+    internal static CommunityLookup? CreateLookup(BaseItem item, Func<Guid, BaseItem?> getItem, double duration = 0)
+    {
+        var effectiveDuration = duration > 0 ? duration : TimeSpan.FromTicks(item.RunTimeTicks ?? 0).TotalSeconds;
+        if (item is Episode episode)
+        {
+            return getItem(episode.SeriesId) is Series series
+                ? CreateEpisodeLookup(series, episode.ParentIndexNumber, episode.IndexNumber, effectiveDuration)
+                : null;
+        }
+
+        return new CommunityLookup(
+            true,
+            Id(item, MetadataProvider.Imdb),
+            Id(item, MetadataProvider.Tmdb),
+            Id(item, MetadataProvider.Tvdb),
+            null,
+            null,
+            string.Empty,
+            effectiveDuration,
+            MalId(item));
+    }
+
+    /// <summary>
     /// Fills the mode for every item the local analysis left without a segment. An item no
     /// source could be asked about is marked <see cref="EpisodeState.AnalysisFailed"/> so the
     /// next scan retries it instead of recording a settled "no segment".
@@ -90,6 +119,7 @@ internal sealed partial class CommunityFallback(
                 continue;
             }
 
+            CommunityRetry.RecordAttempt(episode.EpisodeId, mode, DateTimeOffset.UtcNow);
             var (ranges, sourceName, unavailable) = await FindRangesAsync(episode, lookup, mode, enabled, config, cancellationToken).ConfigureAwait(false);
             if (ranges.Count == 0)
             {
@@ -209,26 +239,32 @@ internal sealed partial class CommunityFallback(
         if (episode.Category == QueuedMediaCategory.Movie)
         {
             return plugin?.GetItem(episode.EpisodeId) is { } movie
-                ? new CommunityLookup(true, Id(movie, MetadataProvider.Imdb), Id(movie, MetadataProvider.Tmdb), Id(movie, MetadataProvider.Tvdb), null, null, string.Empty, episode.Duration)
+                ? CreateLookup(movie, id => plugin.GetItem(id), episode.Duration)
                 : null;
         }
 
         // The series carries the ids the databases address episodes by.
-        if (plugin?.GetItem(episode.SeriesId) is not Series series)
-        {
-            return null;
-        }
+        return plugin?.GetItem(episode.SeriesId) is Series series
+            ? CreateEpisodeLookup(series, episode.SeasonNumber, episode.EpisodeNumber, episode.Duration)
+            : null;
+    }
 
-        return new CommunityLookup(
+    private static CommunityLookup CreateEpisodeLookup(Series series, int? season, int? episode, double duration)
+        => new(
             false,
             Id(series, MetadataProvider.Imdb),
             Id(series, MetadataProvider.Tmdb),
             Id(series, MetadataProvider.Tvdb),
-            episode.SeasonNumber,
-            episode.EpisodeNumber,
+            season,
+            episode,
             series.DisplayOrder ?? string.Empty,
-            episode.Duration);
-    }
+            duration,
+            MalId(series));
+
+    // Metadata plugins for anime store the MyAnimeList id under one of these names.
+    private static string? MalId(BaseItem item)
+        => item.ProviderIds.TryGetValue("MyAnimeList", out var id) && !string.IsNullOrWhiteSpace(id) ? id
+            : item.ProviderIds.TryGetValue("Mal", out id) && !string.IsNullOrWhiteSpace(id) ? id : null;
 
     private static string? Id(BaseItem item, MetadataProvider provider)
         => item.TryGetProviderId(provider, out var id) && !string.IsNullOrWhiteSpace(id) ? id : null;

@@ -91,6 +91,25 @@ public sealed class TestAnalysisScheduler
     }
 
     [Fact]
+    public async Task ChangedItem_UsesConfiguredLibraryQuietPeriodSecondsAndClampsBounds()
+    {
+        Assert.Equal(60, new PluginConfiguration().LibraryQuietPeriodSeconds);
+        Assert.Equal(5, new PluginConfiguration { LibraryQuietPeriodSeconds = 1 }.LibraryQuietPeriodSeconds);
+        Assert.Equal(300, new PluginConfiguration { LibraryQuietPeriodSeconds = 999 }.LibraryQuietPeriodSeconds);
+
+        await using var h = await QueueHarness.StartAsync();
+        Plugin.Instance!.Configuration.LibraryQuietPeriodSeconds = 10;
+
+        var changed = h.Queue.ItemChangedAsync(h.EpisodeId);
+        h.Time.Advance(TimeSpan.FromSeconds(9));
+        Assert.False(changed.IsCompleted);
+
+        h.Time.Advance(TimeSpan.FromSeconds(2));
+        await changed.WaitAsync(Timeout);
+        Assert.True(await h.IsAnalyzedAsync(h.EpisodeId));
+    }
+
+    [Fact]
     public async Task ManualScan_RunsAsItsOwnPassAheadOfALibraryPass_ErasingFirst()
     {
         await using var h = await QueueHarness.StartAsync(gated: true);

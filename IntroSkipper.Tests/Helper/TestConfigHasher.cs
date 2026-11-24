@@ -28,6 +28,13 @@ public sealed class TestConfigHasher
     private static readonly HashSet<string> NotDetection =
     [
         nameof(PluginConfiguration.AutoDetectIntros),
+        nameof(PluginConfiguration.LibraryQuietPeriodSeconds),
+        nameof(PluginConfiguration.OutroTailBufferSeconds),
+        nameof(PluginConfiguration.ApplyOffsetsToForeignOutro),
+        nameof(PluginConfiguration.CommunityRetryNoSegmentsDays),
+        nameof(PluginConfiguration.EnableOnDemandPlaybackCommunityLookup),
+        nameof(PluginConfiguration.WriteEdlOnSegmentChange),
+        nameof(PluginConfiguration.ApplyOutroTailBufferToEdl),
         nameof(PluginConfiguration.SettledSeasonDelayHours),
         nameof(PluginConfiguration.AnalyzeSeasonZero),
         nameof(PluginConfiguration.CacheCompressionLevel),

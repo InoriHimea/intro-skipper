@@ -16,6 +16,7 @@ namespace IntroSkipper.Community;
 /// <param name="Episode">Episode number; <see langword="null"/> for movies.</param>
 /// <param name="DisplayOrder">The series display order; empty for the default (aired) order.</param>
 /// <param name="Duration">Local file duration in seconds.</param>
+/// <param name="MalId">MyAnimeList id of the series or movie when a metadata plugin set one.</param>
 public sealed record CommunityLookup(
     bool IsMovie,
     string? ImdbId,
@@ -24,4 +25,5 @@ public sealed record CommunityLookup(
     int? Season,
     int? Episode,
     string DisplayOrder,
-    double Duration);
+    double Duration,
+    string? MalId = null);
