@@ -1,13 +1,15 @@
 # Intro Skipper — Inori fork
 
 > [!IMPORTANT]
-> **这是非官方维护分支，不是上游发布包。** 已同步上游 `12.0` 分支至 `6ce58f3`（包含 `12.0/v12.0.7.0` 及其后续更新），包含三项补丁：
+> **这是非官方维护分支，不是上游发布包。** 已同步上游 `12.0` 分支至 `6ce58f3`（包含 `12.0/v12.0.7.0` 及其后续更新），包含以下扩展补丁：
 >
-> 1. **片尾保留缓冲**：设置 `IntroEndOffset=5` 且媒体时长已知时，播放 API 返回的片尾跳转终点不晚于媒体结束前 5 秒；已有更长间隙不延长。不改检测结果、数据库或分析 hash。
-> 2. **社区时间点补充**（默认关闭）：本地分析找不到片头/片尾时，从 IntroDB、TheIntroDB 补充，并照常应用偏移设置。本地结果始终优先；关闭时分析 hash 不变。
-> 3. **外源片头终点偏移**：其他提供者写入的播放 `Intro` 行也应用 `IntroStartOffset`/`IntroEndOffset`，本插件自己的行不再重复扣减。只改播放响应，不改数据库、不清理他人片段。
+> 1. **片尾保留缓冲（支持独立配置）**：播放 API 返回的 `Outro` 跳转终点不晚于媒体结束前配置的保留秒数（`OutroTailBufferSeconds`，默认 `-1` 继承 `IntroEndOffset`，`0` 关闭）；已有更长间隙不延长，修改缓冲秒数不改变检测结果、数据库或分析 hash。
+> 2. **社区时间点补充（IntroDB + TheIntroDB + AniSkip）与空结果重查**（默认关闭）：本地分析找不到片头/片尾时，依次从 IntroDB、TheIntroDB、AniSkip（支持 `MyAnimeList` ID 直查或经 `arm.haglund.dev` 将第 1 季/电影的 TVDB/TMDB/IMDb ID 映射）补充并应用偏移设置；对入库后 `CommunityRetryNoSegmentsDays`（默认 7 天）内尚未命中片段的剧集支持每 12 小时自动重查。本地结果始终优先；关闭时分析 hash 不变。
+> 3. **外源片头与片尾偏移对齐**：其他提供者写入的播放 `Intro` 行应用 `IntroStartOffset`/`IntroEndOffset`，开启 `ApplyOffsetsToForeignOutro`（默认开启）时外源 `Outro` 行也应用 `CreditsStartOffset`/`CreditsEndOffset`（随后仍受片尾保留缓冲封顶）；本插件自己的行绝不二次扣减。只改播放响应，不改数据库、不清理他人片段。
+> 4. **按需 `.edl` 同步输出与片尾保护**（默认关闭）：开启 `WriteEdlOnSegmentChange` 后，在 `MediaSegmentMirror` 收敛条目时同步写出与本插件 servable 片段一致、带片尾保留保护（`ApplyOutroTailBufferToEdl`）的同名 `.edl` 文件；通过清单跟踪本插件写出的 `.edl`，仅清理自身托管的空文件或孤儿文件，I/O 异常仅记 warning 不阻断数据库投影。
+> 5. **首次播放即时社区兜底与入库静默等待可调**：支持调整库变更后的分析静默期（`LibraryQuietPeriodSeconds`，默认 60 秒，范围 5–300 秒）；当 `EnableCommunityFallback` 与 `EnableOnDemandPlaybackCommunityLookup` 开启且未分析条目首次播放 `GET /MediaSegments/{itemId}` 返回空 `Intro`/`Outro` 时，以 1.5 秒短超时查询社区源并在响应中即时返回带偏移与片尾保护的片段（超时静默透传，不阻塞播放）。
 >
-> 未据本地测试声称已完成群晖/Infuse 实际播放验收。
+> 未据本地测试声称已完成群晖/Infuse 全部场景实际播放验收。
 
 - [片尾保留补丁说明、90 秒示例与复测方法](patches/outro-tail/README.md)
 - [社区时间点补充说明](patches/community-fallback/README.md)
@@ -15,7 +17,7 @@
 - [本 fork 的版本发布](https://github.com/InoriHimea/intro-skipper/releases)
 - [上游原始项目](https://github.com/intro-skipper/intro-skipper)
 
-补丁发行标签独立于程序集版本；历史发行例如 `12.0/v12.0.4.0-inori-tail5s.1`，当前含三项补丁的发行是 `12.0/v12.0.7.0-inori-introffset.1`（由 fork 的 `Fork Release` workflow 构建，未签名、不派发上游 manifest）。当前源码生成的 DLL 仍为 `IntroSkipper.dll`，程序集/文件版本随上游更新为 `12.0.7.0`。请按 Release 标签、源码提交和 SHA256 区分本地补丁与同版本官方 DLL。下方保留上游介绍、署名和许可；其中上游徽章、签名和 manifest 不代表本 fork 的验证或签名，官方 manifest 也不会安装本补丁。
+补丁发行标签独立于程序集版本；历史发行例如 `12.0/v12.0.4.0-inori-tail5s.1`、`12.0/v12.0.7.0-inori-introffset.1`，当前含上述全部补丁的发行是 `12.0/v12.0.7.0-inori-edlaniskip.1`（由 fork 的 `Fork Release` workflow 构建，未签名、不派发上游 manifest）。当前源码生成的 DLL 仍为 `IntroSkipper.dll`，程序集/文件版本随上游更新为 `12.0.7.0`。请按 Release 标签、源码提交和 SHA256 区分本地补丁与同版本官方 DLL。下方保留上游介绍、署名和许可；其中上游徽章、签名和 manifest 不代表本 fork 的验证或签名，官方 manifest 也不会安装本补丁。
 
 ## 上游项目说明
 
