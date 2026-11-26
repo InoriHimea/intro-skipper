@@ -152,10 +152,6 @@ public sealed partial class IntroSkipperDatabase
                 cancellationToken).ConfigureAwait(false);
     }
 
-    /// <summary>
-    /// Runs the chunked statements of one analysis-record write in a single transaction,
-    /// so a cancelled pass cannot leave a season half-recorded.
-    /// </summary>
     private async Task ExecuteInTransactionAsync(IEnumerable<FormattableString> statements, CancellationToken cancellationToken)
     {
         await InitializeAsync().ConfigureAwait(false);
