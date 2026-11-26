@@ -127,7 +127,7 @@ public sealed class TestEdlFileWriter : IDisposable
         ep.ParentId = seasonId;
         ep.Path = Path.Combine(_dir, "s01e02.mkv");
         ep.RunTimeTicks = 1420 * Second;
-        File.WriteAllText(ep.Path, string.Empty);
+        await File.WriteAllTextAsync(ep.Path, string.Empty);
 
         await db.Database.ReplaceAutoSegmentsAsync(ep.Id, AnalysisMode.Credits, [new Segment(ep.Id, new TimeRange(1330, 1420))], SegmentSource.Chapter);
 
@@ -141,13 +141,13 @@ public sealed class TestEdlFileWriter : IDisposable
 
         var first = await writer.SyncLibraryAsync(resolver, dtoFactory, CancellationToken.None);
         Assert.Equal(new EdlSyncResponse(1, 0, 0, 0), first);
-        Assert.Equal("1330 1415 2\n", File.ReadAllText(edl));
+        Assert.Equal("1330 1415 2\n", await File.ReadAllTextAsync(edl));
 
         // Changing OutroTailBufferSeconds without re-analysis and running SyncLibraryAsync updates the .edl.
         config.OutroTailBufferSeconds = 8;
         var updated = await writer.SyncLibraryAsync(resolver, dtoFactory, CancellationToken.None);
         Assert.Equal(new EdlSyncResponse(1, 0, 0, 0), updated);
-        Assert.Equal("1330 1412 2\n", File.ReadAllText(edl));
+        Assert.Equal("1330 1412 2\n", await File.ReadAllTextAsync(edl));
 
         // Disabling WriteEdlOnSegmentChange and running SyncLibraryAsync removes all managed .edl files.
         config.WriteEdlOnSegmentChange = false;
