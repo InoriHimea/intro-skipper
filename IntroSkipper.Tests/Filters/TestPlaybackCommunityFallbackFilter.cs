@@ -194,6 +194,8 @@ public sealed class TestPlaybackCommunityFallbackFilter : IDisposable
     {
         using var scope = EntrypointTestHelpers.CreatePluginScope(EnabledConfig());
         var (library, itemId) = CreateEpisodeLibrary();
+        // Warm the temp SQLite database migration before measuring the HTTP source timeout.
+        _ = await _db.Database.IsEligibleForOnDemandCommunityLookupAsync(itemId);
         var source = new FakeSource(async (_, cancellationToken) =>
         {
             await Task.Delay(TimeSpan.FromSeconds(5), cancellationToken);
@@ -204,7 +206,7 @@ public sealed class TestPlaybackCommunityFallbackFilter : IDisposable
 
         await PlaybackFilterTestHelpers.RunAsync(
             PlaybackFilterTestHelpers.CreateContext(itemId, result),
-            CreateFilter(library, source, TimeSpan.FromMilliseconds(40)));
+            CreateFilter(library, source, TimeSpan.FromMilliseconds(100)));
 
         Assert.Same(input, result.Value);
         Assert.Equal(1, source.Calls);
