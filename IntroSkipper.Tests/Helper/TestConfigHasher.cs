@@ -224,7 +224,10 @@ public sealed class TestConfigHasher
         // hash of every setting. The pins keep a refactor of the hasher from changing what a
         // stored record means. A blank pattern detects nothing, so it hashes as detection off.
         Case("Recap analysis hash is pinned while subtitle detection is on", Analysis(new PluginConfiguration { EnableSubtitleRecapDetection = true }, AnalysisMode.Recap), "subtitle-v1:A7C626905F2D0CF0:8C5986DAF7BAFC78", true);
-        Case("Preview analysis hash is pinned while subtitle detection is on", Analysis(new PluginConfiguration { EnableSubtitlePreviewDetection = true }, AnalysisMode.Preview), "subtitle-v1:19C776EE18C06441:ED1EF897C859EA54", true);
+        // Upstream wrote subtitle-v1:19C776EE18C06441:ED1EF897C859EA54 under the English-only preview subtitle default;
+        // the CJK wording expansion updates only the subtitle suffix so IsSubtitleOnlyHashChange reruns subtitles alone.
+        Case("Preview analysis hash is pinned while subtitle detection is on", Analysis(new PluginConfiguration { EnableSubtitlePreviewDetection = true }, AnalysisMode.Preview), "subtitle-v1:19C776EE18C06441:BFEFE30CBD7BCC9C", true);
+        Case("Preview analysis legacy English-only subtitle hash is pinned", Analysis(new PluginConfiguration { EnableSubtitlePreviewDetection = true, SubtitlePreviewPattern = PluginConfiguration.LegacyDefaultSubtitlePreviewPattern }, AnalysisMode.Preview), "subtitle-v1:19C776EE18C06441:ED1EF897C859EA54", true);
         Case("Recap analysis treats a blank subtitle pattern as detection off", Analysis(new PluginConfiguration { EnableSubtitleRecapDetection = true, SubtitleRecapPattern = " " }, AnalysisMode.Recap), Analysis(defaults, AnalysisMode.Recap), true);
         Case("Preview analysis treats a blank subtitle pattern as detection off", Analysis(new PluginConfiguration { EnableSubtitlePreviewDetection = true, SubtitlePreviewPattern = string.Empty }, AnalysisMode.Preview), Analysis(defaults, AnalysisMode.Preview), true);
 
