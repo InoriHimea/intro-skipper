@@ -2,8 +2,12 @@
 
 using System;
 using System.IO;
+using System.Threading;
+using System.Threading.Tasks;
 using IntroSkipper.Configuration;
+using IntroSkipper.Data;
 using IntroSkipper.Manager;
+using IntroSkipper.Providers;
 using Jellyfin.Database.Implementations.Enums;
 using MediaBrowser.Controller.Entities.TV;
 using MediaBrowser.Model.MediaSegments;
@@ -13,8 +17,8 @@ using Xunit;
 namespace IntroSkipper.Tests;
 
 /// <summary>
-/// The sidecar <c>.edl</c> follows the servable segments with the playback tail cap, and the
-/// writer only ever deletes files its own manifest says it wrote.
+/// The sidecar <c>.edl</c> follows the configured servable segments with the playback tail cap
+/// and first-episode policy, and the writer only ever deletes files its own manifest says it wrote.
 /// </summary>
 public sealed class TestEdlFileWriter : IDisposable
 {
@@ -40,6 +44,117 @@ public sealed class TestEdlFileWriter : IDisposable
             5);
 
         Assert.Equal("90.5 120 2\n1300 1415 2\n", content);
+    }
+
+    [Fact]
+    public void ContentFiltersSegmentTypesAndCapsOptedInPreview()
+    {
+        var id = Guid.NewGuid();
+        var allTypes = new[]
+        {
+            Seg(id, MediaSegmentType.Recap, 0, 30 * Second),
+            Seg(id, MediaSegmentType.Intro, 60 * Second, 150 * Second),
+            Seg(id, MediaSegmentType.Commercial, 600 * Second, 630 * Second),
+            Seg(id, MediaSegmentType.Outro, 1260 * Second, 1350 * Second),
+            Seg(id, MediaSegmentType.Preview, 1350 * Second, 1420 * Second),
+        };
+
+        // By default only Intro and Outro are exported, so a post-credits scene marked Preview is not cut.
+        Assert.Equal(
+            "60 150 2\n1260 1350 2\n",
+            EdlFileWriter.BuildContent(allTypes, 1420 * Second, 5, new PluginConfiguration()));
+
+        // Opting into Preview also caps a tail-reaching Preview at the 5 s tail buffer.
+        var withPreview = new PluginConfiguration { EdlIncludePreview = true, ApplyOutroTailBufferToPreview = true };
+        Assert.Equal(
+            "60 150 2\n1260 1350 2\n1350 1415 2\n",
+            EdlFileWriter.BuildContent(allTypes, 1420 * Second, 5, withPreview));
+
+        var allEnabled = new PluginConfiguration
+        {
+            EdlIncludeRecap = true,
+            EdlIncludePreview = true,
+            EdlIncludeCommercial = true,
+            ApplyOutroTailBufferToPreview = false,
+        };
+        Assert.Equal(
+            "0 30 2\n60 150 2\n600 630 2\n1260 1350 2\n1350 1420 2\n",
+            EdlFileWriter.BuildContent(allTypes, 1420 * Second, 5, allEnabled));
+    }
+
+    [Fact]
+    public void SyncHonorsFirstEpisodeIntroSuppressionAndImmediateMediaRemoval()
+    {
+        using var scope = Scope(new PluginConfiguration
+        {
+            WriteEdlOnSegmentChange = true,
+            FirstEpisodeIntroMode = PluginConfiguration.FirstEpisodeIntroModeIgnore,
+            OutroTailBufferSeconds = 5,
+        });
+        var seriesId = Guid.NewGuid();
+        var seasonId = Guid.NewGuid();
+        var series = JellyfinItems.Series(seriesId);
+        var season = JellyfinItems.Season(seasonId, seriesId, 1);
+        var ep1 = JellyfinItems.Episode(Guid.NewGuid(), seriesId, seasonId, seasonNumber: 1, episodeNumber: 1);
+        ep1.ParentId = seasonId;
+        ep1.Path = Path.Combine(_dir, "s01e01.mkv");
+        ep1.RunTimeTicks = 1420 * Second;
+        File.WriteAllText(ep1.Path, string.Empty);
+
+        var library = EntrypointTestHelpers.FakeLibraryManager.Create([], [series, season, ep1]);
+        var writer = new EdlFileWriter(library, NullLogger<EdlFileWriter>.Instance) { ManifestPathOverride = Path.Combine(_dir, "manifest.json") };
+
+        writer.Sync(ep1.Id, [Seg(ep1.Id, MediaSegmentType.Intro, 10 * Second, 90 * Second), Seg(ep1.Id, MediaSegmentType.Outro, 1330 * Second, 1420 * Second)]);
+        var edl = Path.ChangeExtension(ep1.Path, ".edl");
+        Assert.Equal("1330 1415 2\n", File.ReadAllText(edl));
+        Assert.Equal(1, writer.GetManagedCount());
+
+        // Removing the media notifies RemoveForMediaPath and deletes the managed .edl immediately.
+        writer.RemoveForMediaPath(ep1.Path);
+        Assert.False(File.Exists(edl));
+        Assert.Equal(0, writer.GetManagedCount());
+    }
+
+    [Fact]
+    public async Task SyncLibraryAsyncRewritesAllItemsAndCleansWhenDisabled()
+    {
+        using var db = new TempSegmentDb();
+        var seriesId = Guid.NewGuid();
+        var seasonId = Guid.NewGuid();
+        var series = JellyfinItems.Series(seriesId);
+        var season = JellyfinItems.Season(seasonId, seriesId, 1);
+        var ep = JellyfinItems.Episode(Guid.NewGuid(), seriesId, seasonId, seasonNumber: 1, episodeNumber: 2);
+        ep.ParentId = seasonId;
+        ep.Path = Path.Combine(_dir, "s01e02.mkv");
+        ep.RunTimeTicks = 1420 * Second;
+        File.WriteAllText(ep.Path, string.Empty);
+
+        await db.Database.ReplaceAutoSegmentsAsync(ep.Id, AnalysisMode.Credits, [new Segment(ep.Id, new TimeRange(1330, 1420))], SegmentSource.Chapter);
+
+        var config = new PluginConfiguration { WriteEdlOnSegmentChange = true, OutroTailBufferSeconds = 5 };
+        using var scope = Scope(config);
+        var library = EntrypointTestHelpers.FakeLibraryManager.Create([JellyfinItems.Folder("Media")], [series, season, ep]);
+        var resolver = EntrypointTestHelpers.CreateSeasonResolver(library);
+        var dtoFactory = new SegmentDtoFactory(db.Database);
+        var writer = new EdlFileWriter(library, NullLogger<EdlFileWriter>.Instance) { ManifestPathOverride = Path.Combine(_dir, "sync-all.json") };
+        var edl = Path.ChangeExtension(ep.Path, ".edl");
+
+        var first = await writer.SyncLibraryAsync(resolver, dtoFactory, CancellationToken.None);
+        Assert.Equal(new EdlSyncResponse(1, 0, 0, 0), first);
+        Assert.Equal("1330 1415 2\n", File.ReadAllText(edl));
+
+        // Changing OutroTailBufferSeconds without re-analysis and running SyncLibraryAsync updates the .edl.
+        config.OutroTailBufferSeconds = 8;
+        var updated = await writer.SyncLibraryAsync(resolver, dtoFactory, CancellationToken.None);
+        Assert.Equal(new EdlSyncResponse(1, 0, 0, 0), updated);
+        Assert.Equal("1330 1412 2\n", File.ReadAllText(edl));
+
+        // Disabling WriteEdlOnSegmentChange and running SyncLibraryAsync removes all managed .edl files.
+        config.WriteEdlOnSegmentChange = false;
+        var cleaned = await writer.SyncLibraryAsync(resolver, dtoFactory, CancellationToken.None);
+        Assert.Equal(new EdlSyncResponse(0, 0, 1, 0), cleaned);
+        Assert.False(File.Exists(edl));
+        Assert.Equal(0, writer.GetManagedCount());
     }
 
     [Theory]

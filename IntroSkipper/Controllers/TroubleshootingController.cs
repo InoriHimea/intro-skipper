@@ -6,10 +6,13 @@
 
 using System.Net.Mime;
 using System.Runtime.InteropServices;
+using IntroSkipper.Community;
 using IntroSkipper.Configuration;
 using IntroSkipper.Data;
 using IntroSkipper.FFmpeg;
 using IntroSkipper.Helper;
+using IntroSkipper.Manager;
+using IntroSkipper.Providers;
 using IntroSkipper.ScheduledTasks;
 using IntroSkipper.Services;
 using MediaBrowser.Common;
@@ -36,6 +39,11 @@ public partial class TroubleshootingController : ControllerBase
     private readonly IFFmpegService _ffmpegService;
     private readonly ITaskManager _taskManager;
     private readonly AnalysisScheduler _queue;
+    private readonly EdlFileWriter? _edlWriter;
+    private readonly SeasonResolver? _seasonResolver;
+    private readonly SegmentDtoFactory? _segmentDtoFactory;
+    private readonly IReadOnlyList<ICommunitySource> _communitySources;
+    private readonly TimeProvider _timeProvider;
 
     /// <summary>
     /// Initializes a new instance of the <see cref="TroubleshootingController"/> class.
@@ -45,18 +53,33 @@ public partial class TroubleshootingController : ControllerBase
     /// <param name="ffmpegService">FFmpeg service.</param>
     /// <param name="taskManager">Scheduled task manager, used to report the detection task's last run and progress.</param>
     /// <param name="queue">Analysis queue, used to report what is running and pending.</param>
+    /// <param name="edlWriter">Sidecar EDL writer, used to sync or clean managed files and report tracked counts.</param>
+    /// <param name="seasonResolver">Season resolver for full-library EDL sync.</param>
+    /// <param name="segmentDtoFactory">Servable segment factory for full-library EDL sync.</param>
+    /// <param name="communitySources">Registered community timestamp sources.</param>
+    /// <param name="timeProvider">Clock for rate-limit cooldown reporting.</param>
     public TroubleshootingController(
         IApplicationHost applicationHost,
         ILogger<TroubleshootingController> logger,
         IFFmpegService ffmpegService,
         ITaskManager taskManager,
-        AnalysisScheduler queue)
+        AnalysisScheduler queue,
+        EdlFileWriter? edlWriter = null,
+        SeasonResolver? seasonResolver = null,
+        SegmentDtoFactory? segmentDtoFactory = null,
+        IEnumerable<ICommunitySource>? communitySources = null,
+        TimeProvider? timeProvider = null)
     {
         _applicationHost = applicationHost;
         _logger = logger;
         _ffmpegService = ffmpegService;
         _taskManager = taskManager;
         _queue = queue;
+        _edlWriter = edlWriter;
+        _seasonResolver = seasonResolver;
+        _segmentDtoFactory = segmentDtoFactory;
+        _communitySources = communitySources is null ? [] : [.. communitySources];
+        _timeProvider = timeProvider ?? TimeProvider.System;
     }
 
     /// <summary>
@@ -119,6 +142,25 @@ public partial class TroubleshootingController : ControllerBase
         return NoContent();
     }
 
+    /// <summary>
+    /// Synchronizes sidecar <c>.edl</c> files across the entire library when EDL writing is enabled,
+    /// or removes all files tracked in <c>edl-managed.json</c> when it is disabled.
+    /// </summary>
+    /// <param name="cancellationToken">Cancellation token.</param>
+    /// <response code="200">EDL synchronization or cleanup completed.</response>
+    /// <returns>Counts of written, unchanged, removed and failed files.</returns>
+    [HttpPost("Edl/Sync")]
+    [ProducesResponseType(StatusCodes.Status200OK)]
+    public async Task<ActionResult<EdlSyncResponse>> SyncEdlFilesAsync(CancellationToken cancellationToken = default)
+    {
+        if (_edlWriter is null || _seasonResolver is null || _segmentDtoFactory is null)
+        {
+            return Ok(new EdlSyncResponse(0, 0, 0, 0));
+        }
+
+        return Ok(await _edlWriter.SyncLibraryAsync(_seasonResolver, _segmentDtoFactory, cancellationToken).ConfigureAwait(false));
+    }
+
     private SupportBundle BuildSupportBundle()
     {
         var plugin = Plugin.Instance!;
@@ -148,6 +190,12 @@ public partial class TroubleshootingController : ControllerBase
                         "File Transformation plugin",
                         (plugin.Configuration.FileTransformationPluginEnabled ? "installed" : "not installed")
                         + (plugin.Configuration.UseFileTransformationPlugin ? ", enabled in settings" : ", disabled in settings")),
+                    new(
+                        "Managed EDL files",
+                        DescribeEdlStatus(plugin.Configuration)),
+                    new(
+                        "Community sources",
+                        DescribeCommunitySources(plugin.Configuration)),
                 ],
             },
             new("Changed settings")
@@ -280,5 +328,29 @@ public partial class TroubleshootingController : ControllerBase
         var version = Plugin.Instance!.Version.ToString(4);
         var commit = Commit.CommitHash;
         return commit.Length >= 12 ? string.Concat(version, "+", commit.AsSpan(0, 12)) : version;
+    }
+
+    private string DescribeEdlStatus(PluginConfiguration config)
+    {
+        var count = _edlWriter?.GetManagedCount() ?? 0;
+        return (config.WriteEdlOnSegmentChange ? "enabled" : "disabled")
+            + FormattableString.Invariant($", {count} tracked");
+    }
+
+    private string DescribeCommunitySources(PluginConfiguration config)
+    {
+        if (!config.EnableCommunityFallback)
+        {
+            return "disabled";
+        }
+
+        if (_communitySources.Count == 0)
+        {
+            return "enabled (no sources registered)";
+        }
+
+        var now = _timeProvider.GetUtcNow();
+        var details = string.Join(", ", _communitySources.Select(source => $"{source.Name}: {source.DescribeStatus(config, now)}"));
+        return $"enabled ({details})";
     }
 }

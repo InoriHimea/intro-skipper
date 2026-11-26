@@ -8,6 +8,7 @@ export const detectionTab: Tab = {
     render(container, signal) {
         const form = configForm(signal);
         const silenceVisible = () => configStore.get("AdjustIntroBasedOnSilence") === true;
+        const edlVisible = () => configStore.get("WriteEdlOnSegmentChange") === true;
 
         container.append(
             form.field("SnapToKeyframe"),
@@ -19,9 +20,13 @@ export const detectionTab: Tab = {
             form.field("CreditsEndOffset"),
             form.field("IncludeCreditsEndOffsetWhenSnapping"),
             form.field("OutroTailBufferSeconds"),
+            form.field("ApplyOutroTailBufferToPreview"),
             form.field("ApplyOffsetsToForeignOutro"),
             form.field("WriteEdlOnSegmentChange"),
-            form.field("ApplyOutroTailBufferToEdl", { visible: () => configStore.get("WriteEdlOnSegmentChange") === true }),
+            form.field("ApplyOutroTailBufferToEdl", { visible: edlVisible }),
+            form.field("EdlIncludeRecap", { visible: edlVisible }),
+            form.field("EdlIncludePreview", { visible: edlVisible }),
+            form.field("EdlIncludeCommercial", { visible: edlVisible }),
             form.field("AdjustWindowInward"),
             form.field("AdjustWindowOutward"),
             form.field("EndSnapThreshold"),

@@ -12,6 +12,7 @@ using IntroSkipper.Filters;
 using Jellyfin.Database.Implementations.Enums;
 using MediaBrowser.Controller.Entities;
 using MediaBrowser.Controller.Entities.TV;
+using MediaBrowser.Controller.Library;
 using MediaBrowser.Model.Entities;
 using MediaBrowser.Model.MediaSegments;
 using MediaBrowser.Model.Querying;
@@ -230,13 +231,88 @@ public sealed class TestPlaybackCommunityFallbackFilter : IDisposable
         Assert.Equal(0, source.Calls);
     }
 
+    [Fact]
+    public async Task UnanalyzedSeasonPremiereHonorsFirstEpisodeIntroFilterWhileKeepingTailProtectedOutro()
+    {
+        using var scope = EntrypointTestHelpers.CreatePluginScope(new PluginConfiguration
+        {
+            EnableCommunityFallback = true,
+            EnableOnDemandPlaybackCommunityLookup = true,
+            FirstEpisodeIntroMode = PluginConfiguration.FirstEpisodeIntroModeIgnore,
+            ScanIntroduction = true,
+            ScanCredits = true,
+            IntroEndOffset = 5,
+            OutroTailBufferSeconds = 5,
+        });
+
+        var seriesId = Guid.NewGuid();
+        var seasonId = Guid.NewGuid();
+        var series = JellyfinItems.Series(seriesId);
+        series.SetProviderId(MetadataProvider.Imdb, "tt33258199");
+        var season = JellyfinItems.Season(seasonId, seriesId, 1);
+        var ep1 = JellyfinItems.Episode(Guid.NewGuid(), seriesId, seasonId, seasonNumber: 1, episodeNumber: 1);
+        ep1.RunTimeTicks = 1420 * Second;
+        ep1.ParentId = seasonId;
+        var library = EntrypointTestHelpers.FakeLibraryManager.Create([], [series, season, ep1]);
+
+        var source = new FakeSource((_, _) => Task.FromResult(new CommunityAnswer(
+            CommunityAnswerKind.Found,
+            [new CommunityRange(10, 90)],
+            [new CommunityRange(1330, 1420)],
+            1420)));
+        var fallback = CreateFilter(library, source);
+        var firstEpisode = new MediaSegmentsFirstEpisodeFilter(library, NullLogger<MediaSegmentsFirstEpisodeFilter>.Instance);
+        var offsets = new PlaybackIntroOffsetFilter(library, new FakeJellyfinSegmentStore(), NullLogger<PlaybackIntroOffsetFilter>.Instance);
+        var tail = new PlaybackOutroTailFilter(library);
+
+        var result = new OkObjectResult(new QueryResult<MediaSegmentDto>([]));
+        await PlaybackFilterTestHelpers.RunAsync(PlaybackFilterTestHelpers.CreateContext(ep1.Id, result), fallback, firstEpisode, offsets, tail);
+
+        var output = Assert.IsType<QueryResult<MediaSegmentDto>>(result.Value);
+        var outro = Assert.Single(output.Items);
+        Assert.Equal(MediaSegmentType.Outro, outro.Type);
+        Assert.Equal(1415 * Second, outro.EndTicks);
+    }
+
+    [Fact]
+    public async Task NotFoundCacheExpiresAfterTwentyMinutesWhileFoundStaysCached()
+    {
+        using var scope = EntrypointTestHelpers.CreatePluginScope(EnabledConfig());
+        var (library, itemId) = CreateEpisodeLibrary();
+        var clock = new AdjustableClock(new DateTimeOffset(2026, 11, 27, 0, 0, 0, TimeSpan.Zero));
+        var answer = CommunityAnswer.NotFound;
+        var source = new FakeSource((_, _) => Task.FromResult(answer));
+        var filter = new PlaybackCommunityFallbackFilter(library, _db.Database, [source], NullLogger<PlaybackCommunityFallbackFilter>.Instance, timeProvider: clock);
+
+        await PlaybackFilterTestHelpers.RunAsync(PlaybackFilterTestHelpers.CreateContext(itemId, new OkObjectResult(new QueryResult<MediaSegmentDto>([]))), filter);
+        Assert.Equal(1, source.Calls);
+
+        // Within 20 minutes the cached miss is reused.
+        clock.Advance(TimeSpan.FromMinutes(15));
+        await PlaybackFilterTestHelpers.RunAsync(PlaybackFilterTestHelpers.CreateContext(itemId, new OkObjectResult(new QueryResult<MediaSegmentDto>([]))), filter);
+        Assert.Equal(1, source.Calls);
+
+        // Past 20 minutes the miss expires and picks up a newly submitted community timestamp.
+        answer = new CommunityAnswer(CommunityAnswerKind.Found, [new CommunityRange(10, 90)], [], 1420);
+        clock.Advance(TimeSpan.FromMinutes(6));
+        var hitResult = new OkObjectResult(new QueryResult<MediaSegmentDto>([]));
+        await PlaybackFilterTestHelpers.RunAsync(PlaybackFilterTestHelpers.CreateContext(itemId, hitResult), filter);
+        Assert.Equal(2, source.Calls);
+        Assert.Single(Assert.IsType<QueryResult<MediaSegmentDto>>(hitResult.Value).Items);
+
+        // Found stays cached well past 20 minutes (up to 6 hours).
+        clock.Advance(TimeSpan.FromHours(2));
+        await PlaybackFilterTestHelpers.RunAsync(PlaybackFilterTestHelpers.CreateContext(itemId, new OkObjectResult(new QueryResult<MediaSegmentDto>([]))), filter);
+        Assert.Equal(2, source.Calls);
+    }
+
     private static PluginConfiguration EnabledConfig() => new()
     {
         EnableCommunityFallback = true,
         EnableOnDemandPlaybackCommunityLookup = true,
     };
 
-    private static (MediaBrowser.Controller.Library.ILibraryManager Library, Guid ItemId) CreateEpisodeLibrary()
+    private static (ILibraryManager Library, Guid ItemId) CreateEpisodeLibrary()
     {
         var series = new Series { Id = Guid.NewGuid(), Name = "Series" };
         series.SetProviderId(MetadataProvider.Imdb, "tt33258199");
@@ -252,7 +328,7 @@ public sealed class TestPlaybackCommunityFallbackFilter : IDisposable
     }
 
     private PlaybackCommunityFallbackFilter CreateFilter(
-        MediaBrowser.Controller.Library.ILibraryManager library,
+        ILibraryManager library,
         ICommunitySource source,
         TimeSpan? timeout = null)
         => new(library, _db.Database, [source], NullLogger<PlaybackCommunityFallbackFilter>.Instance, timeout);
@@ -270,5 +346,14 @@ public sealed class TestPlaybackCommunityFallbackFilter : IDisposable
             Calls++;
             return lookup(query, cancellationToken);
         }
+    }
+
+    private sealed class AdjustableClock(DateTimeOffset initial) : TimeProvider
+    {
+        private DateTimeOffset _now = initial;
+
+        public override DateTimeOffset GetUtcNow() => _now;
+
+        public void Advance(TimeSpan delta) => _now += delta;
     }
 }

@@ -41,6 +41,20 @@ internal abstract partial class CommunityHttpSource(IHttpClientFactory httpClien
     public abstract Task<CommunityAnswer> LookupAsync(CommunityLookup lookup, CancellationToken cancellationToken);
 
     /// <inheritdoc />
+    public string DescribeStatus(PluginConfiguration config, DateTimeOffset now)
+    {
+        if (!IsEnabled(config))
+        {
+            return "disabled";
+        }
+
+        var remaining = _coolDownUntil - now;
+        return remaining > TimeSpan.Zero
+            ? FormattableString.Invariant($"rate-limited ({Math.Max(1, (int)Math.Ceiling(remaining.TotalMinutes))} min left)")
+            : "ready";
+    }
+
+    /// <inheritdoc />
     public void Dispose()
     {
         Dispose(true);

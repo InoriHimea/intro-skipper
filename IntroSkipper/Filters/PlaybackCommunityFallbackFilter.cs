@@ -32,13 +32,31 @@ internal sealed partial class PlaybackCommunityFallbackFilter : IAsyncResultFilt
     /// </summary>
     internal static readonly TimeSpan LookupTimeout = TimeSpan.FromMilliseconds(1500);
 
+    /// <summary>
+    /// In-memory retention for positive community answers.
+    /// </summary>
+    internal static readonly TimeSpan FoundTtl = TimeSpan.FromHours(6);
+
+    /// <summary>
+    /// In-memory retention for definitive misses, short enough that newly aired episodes
+    /// pick up community submissions later the same day.
+    /// </summary>
+    internal static readonly TimeSpan NotFoundTtl = TimeSpan.FromMinutes(20);
+
+    /// <summary>
+    /// Upper bound on cached item-source entries.
+    /// </summary>
+    internal const int MaxCacheEntries = 2048;
+
     private readonly ILibraryManager _libraryManager;
     private readonly ILogger<PlaybackCommunityFallbackFilter> _logger;
     private readonly IServiceProvider? _serviceProvider;
     private readonly TimeSpan _timeout;
-    private readonly ConcurrentDictionary<(Guid ItemId, string Source), CommunityAnswer> _answers = new();
+    private readonly ConcurrentDictionary<(Guid ItemId, string Source), CachedAnswer> _answers = new();
+    private TimeProvider? _timeProvider;
     private IntroSkipperDatabase? _database;
     private IReadOnlyList<ICommunitySource>? _sources;
+    private long _sequence;
 
     /// <summary>
     /// Initializes a new instance of the <see cref="PlaybackCommunityFallbackFilter"/> class
@@ -49,18 +67,21 @@ internal sealed partial class PlaybackCommunityFallbackFilter : IAsyncResultFilt
     /// <param name="sources">Community sources in priority order.</param>
     /// <param name="logger">Logger.</param>
     /// <param name="timeout">Optional lookup timeout; defaults to <see cref="LookupTimeout"/>.</param>
+    /// <param name="timeProvider">Optional clock; defaults to <see cref="TimeProvider.System"/>.</param>
     public PlaybackCommunityFallbackFilter(
         ILibraryManager libraryManager,
         IntroSkipperDatabase database,
         IEnumerable<ICommunitySource> sources,
         ILogger<PlaybackCommunityFallbackFilter> logger,
-        TimeSpan? timeout = null)
+        TimeSpan? timeout = null,
+        TimeProvider? timeProvider = null)
     {
         _libraryManager = libraryManager;
         _database = database;
         _sources = [.. sources];
         _logger = logger;
         _timeout = timeout ?? LookupTimeout;
+        _timeProvider = timeProvider ?? TimeProvider.System;
     }
 
     /// <summary>
@@ -213,6 +234,7 @@ internal sealed partial class PlaybackCommunityFallbackFilter : IAsyncResultFilt
         var added = new List<MediaSegmentDto>();
         var offsets = PlaybackIntroOffsets.From(config) with { ApplyToForeignOutro = true };
         var tailBuffer = config.EffectiveOutroTailBufferSeconds;
+        var now = GetTimeProvider().GetUtcNow();
 
         if (config.ScanIntroduction)
         {
@@ -231,12 +253,12 @@ internal sealed partial class PlaybackCommunityFallbackFilter : IAsyncResultFilt
             foreach (var source in enabled)
             {
                 var key = (itemId, source.Name);
-                if (!_answers.TryGetValue(key, out var answer))
+                if (!TryGetCached(key, now, out var answer))
                 {
                     answer = await source.LookupAsync(lookup, cancellationToken).ConfigureAwait(false);
                     if (answer.Kind != CommunityAnswerKind.Unavailable)
                     {
-                        _answers[key] = answer;
+                        StoreCached(key, answer, now);
                     }
                 }
 
@@ -273,15 +295,73 @@ internal sealed partial class PlaybackCommunityFallbackFilter : IAsyncResultFilt
         }
     }
 
+    private bool TryGetCached((Guid ItemId, string Source) key, DateTimeOffset now, out CommunityAnswer answer)
+    {
+        if (_answers.TryGetValue(key, out var cached))
+        {
+            if (now < cached.ExpiresAt)
+            {
+                answer = cached.Answer;
+                return true;
+            }
+
+            _answers.TryRemove(key, out _);
+        }
+
+        answer = CommunityAnswer.NotFound;
+        return false;
+    }
+
+    private void StoreCached((Guid ItemId, string Source) key, CommunityAnswer answer, DateTimeOffset now)
+    {
+        if (_answers.Count >= MaxCacheEntries && !_answers.ContainsKey(key))
+        {
+            EvictOneOrExpired(now);
+        }
+
+        var ttl = answer.Kind == CommunityAnswerKind.Found ? FoundTtl : NotFoundTtl;
+        var seq = Interlocked.Increment(ref _sequence);
+        _answers[key] = new CachedAnswer(answer, now + ttl, seq);
+    }
+
+    private void EvictOneOrExpired(DateTimeOffset now)
+    {
+        var removedAny = false;
+        (Guid ItemId, string Source)? oldestKey = null;
+        var oldestSequence = long.MaxValue;
+        foreach (var pair in _answers)
+        {
+            if (now >= pair.Value.ExpiresAt)
+            {
+                removedAny |= _answers.TryRemove(pair.Key, out _);
+            }
+            else if (pair.Value.Sequence < oldestSequence)
+            {
+                oldestSequence = pair.Value.Sequence;
+                oldestKey = pair.Key;
+            }
+        }
+
+        if (!removedAny && oldestKey is { } victim)
+        {
+            _answers.TryRemove(victim, out _);
+        }
+    }
+
     private IntroSkipperDatabase GetDatabase()
         => _database ??= _serviceProvider!.GetRequiredService<IntroSkipperDatabase>();
 
     private IReadOnlyList<ICommunitySource> GetSources()
         => _sources ??= [.. _serviceProvider!.GetServices<ICommunitySource>()];
 
+    private TimeProvider GetTimeProvider()
+        => _timeProvider ??= _serviceProvider?.GetService<TimeProvider>() ?? TimeProvider.System;
+
     [LoggerMessage(Level = LogLevel.Debug, Message = "On-demand playback community lookup timed out for item {ItemId}; passing response through unchanged.")]
     private static partial void LogLookupTimedOut(ILogger logger, Guid itemId);
 
     [LoggerMessage(Level = LogLevel.Warning, Message = "On-demand playback community lookup failed for item {ItemId}; passing response through unchanged.")]
     private static partial void LogLookupFailed(ILogger logger, Guid itemId, Exception exception);
+
+    private readonly record struct CachedAnswer(CommunityAnswer Answer, DateTimeOffset ExpiresAt, long Sequence);
 }

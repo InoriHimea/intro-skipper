@@ -97,6 +97,9 @@ public class PluginConfiguration : BasePluginConfiguration
     internal const string LegacyDefaultCreditsPatternWithoutOutro = @"(^|\s)(Credits?|ED|Ending)(\s|$)";
     internal const string LegacyDefaultCreditsPatternWithoutEd = @"(^|\s)(Credits?|Ending)(\s|$)";
 
+    // The default preview subtitle pattern before the Japanese, Chinese and Korean wording expansion. Frozen.
+    internal const string LegacyDefaultSubtitlePreviewPattern = @"\b(?:here(?:'|’)?s|now)\s+the\s+preview\b|^\W*(?:\[[^\]]*\]|\([^)]*\)|[^\s:]+:)?\s*next\s+time\b";
+
     private string? _firstEpisodeIntroMode;
     private int _settledSeasonChromaprintConsensusEpisodes = DefaultSettledSeasonChromaprintConsensusEpisodes;
     private int _libraryQuietPeriodSeconds = 60;
@@ -584,11 +587,11 @@ public class PluginConfiguration : BasePluginConfiguration
     /// against the cue text with markup removed and whitespace collapsed.
     /// </summary>
     /// <value>
-    /// The default anchors "next time" to the start of the cue, allowing one speaker label
-    /// before it (<c>NARRATOR:</c>, <c>[Narrator]</c>, <c>(narrator)</c>), so dialogue that only
-    /// contains it ("Try harder next time.") does not match.
+    /// The default matches English, Japanese, Chinese and Korean preview cues, anchoring phrase
+    /// headers to the start of the cue (allowing one optional speaker or bracket label) so
+    /// ordinary dialogue that merely mentions a preview does not match.
     /// </value>
-    public string SubtitlePreviewPattern { get; set; } = @"\b(?:here(?:'|’)?s|now)\s+the\s+preview\b|^\W*(?:\[[^\]]*\]|\([^)]*\)|[^\s:]+:)?\s*next\s+time\b";
+    public string SubtitlePreviewPattern { get; set; } = @"\b(?:here(?:'|’)?s|now)\s+the\s+preview\b|^[^A-Za-z0-9\u00C0-\u024F\u3040-\u30FF\u4E00-\u9FFF\uAC00-\uD7A3]*(?:\[[^\]]*\]|\([^)]*\)|（[^）]*）|【[^】]*】|[^\s:：]+[:：])?\s*(?:next\s+time\b|(?:次回予告|下[集回][預预]告|다음\s*(?:화|이야기)\s*예고)(?=$|[\s:：!！?？…。「『【\]）】\-—~～,，、.]|第))";
 
     /// <summary>
     /// Gets or sets the comma-separated language codes of the subtitles that recap and preview
@@ -630,6 +633,13 @@ public class PluginConfiguration : BasePluginConfiguration
     public int OutroTailBufferSeconds { get; set; } = -1;
 
     /// <summary>
+    /// Gets or sets a value indicating whether the playback tail buffer
+    /// (<see cref="EffectiveOutroTailBufferSeconds"/>) also caps <c>Preview</c> segments that
+    /// reach into the protected end of the media. Playback-only: never changes any analysis hash.
+    /// </summary>
+    public bool ApplyOutroTailBufferToPreview { get; set; } = true;
+
+    /// <summary>
     /// Gets or sets a value indicating whether the playback response applies
     /// <see cref="CreditsStartOffset"/> and <see cref="CreditsEndOffset"/> to Outro rows another
     /// provider wrote. Intro Skipper's own rows already carry those offsets and are never touched.
@@ -644,9 +654,28 @@ public class PluginConfiguration : BasePluginConfiguration
 
     /// <summary>
     /// Gets or sets a value indicating whether the written <c>.edl</c> keeps the
-    /// <see cref="EffectiveOutroTailBufferSeconds"/> tail outside every Outro.
+    /// <see cref="EffectiveOutroTailBufferSeconds"/> tail outside every Outro (and Preview when
+    /// <see cref="ApplyOutroTailBufferToPreview"/> is enabled).
     /// </summary>
     public bool ApplyOutroTailBufferToEdl { get; set; } = true;
+
+    /// <summary>
+    /// Gets or sets a value indicating whether <c>Recap</c> segments are written into sidecar
+    /// <c>.edl</c> files in addition to <c>Intro</c> and <c>Outro</c>.
+    /// </summary>
+    public bool EdlIncludeRecap { get; set; }
+
+    /// <summary>
+    /// Gets or sets a value indicating whether <c>Preview</c> segments are written into sidecar
+    /// <c>.edl</c> files in addition to <c>Intro</c> and <c>Outro</c>.
+    /// </summary>
+    public bool EdlIncludePreview { get; set; }
+
+    /// <summary>
+    /// Gets or sets a value indicating whether <c>Commercial</c> segments are written into sidecar
+    /// <c>.edl</c> files in addition to <c>Intro</c> and <c>Outro</c>.
+    /// </summary>
+    public bool EdlIncludeCommercial { get; set; }
 
     /// <summary>
     /// Gets the tail seconds playback protection uses: <see cref="OutroTailBufferSeconds"/> when
@@ -903,6 +932,11 @@ public class PluginConfiguration : BasePluginConfiguration
         if (ChapterAnalyzerRecapPattern is LegacyDefaultRecapPattern or LegacyDefaultRecapPatternBefore101122)
         {
             ChapterAnalyzerRecapPattern = defaults.ChapterAnalyzerRecapPattern;
+        }
+
+        if (SubtitlePreviewPattern == LegacyDefaultSubtitlePreviewPattern)
+        {
+            SubtitlePreviewPattern = defaults.SubtitlePreviewPattern;
         }
     }
 }

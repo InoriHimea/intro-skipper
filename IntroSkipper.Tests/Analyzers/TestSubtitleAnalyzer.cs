@@ -716,6 +716,55 @@ public sealed class TestSubtitleAnalyzer
         Assert.Equal(expectedDetected, (await database.GetSegmentsAsync(episodeId)).Any(segment => segment.Type == AnalysisMode.Preview));
     }
 
+    [Theory]
+    [InlineData("Here's the preview", true)]
+    [InlineData("[Narrator] Next time on the show", true)]
+    [InlineData("次回予告", true)]
+    [InlineData("【次回予告】", true)]
+    [InlineData("【第12話】次回予告", true)]
+    [InlineData("[ナレーション] 次回予告：決戦", true)]
+    [InlineData("次回予告「旅立ち」", true)]
+    [InlineData("下集预告", true)]
+    [InlineData("下集預告：決戰", true)]
+    [InlineData("（旁白）下回预告", true)]
+    [InlineData("다음 화 예고", true)]
+    [InlineData("다음 이야기 예고", true)]
+    [InlineData("Try harder next time.", false)]
+    [InlineData("それは次回予告で見た", false)]
+    [InlineData("次回予告なんてないよ", false)]
+    [InlineData("我不想看下集预告", false)]
+    [InlineData("下集预告里骗人的", false)]
+    [InlineData("다음 화 예고는 없어", false)]
+    public async Task DefaultPreviewPattern_MatchesOnlyCuesThatIntroduceAPreview(string cueText, bool matches)
+    {
+        var episodeId = Guid.NewGuid();
+        var database = DatabaseTestHelpers.CreateTempSegmentDatabase();
+        var config = new PluginConfiguration
+        {
+            EnableSubtitlePreviewDetection = true,
+            MinimumPreviewDuration = 5,
+            MaximumPreviewDuration = 120,
+        };
+        using var pluginScope = EntrypointTestHelpers.CreatePluginScope(config);
+        var ffmpeg = new StubFFmpegService
+        {
+            Subtitles = _ => new([new SubtitleCue(150, 153, cueText)], Complete: true),
+        };
+        var episode = new QueuedEpisode
+        {
+            EpisodeId = episodeId,
+            Duration = 180,
+            Path = "episode.mkv",
+            AnalysisConfigHash = "subtitle",
+        };
+        var analyzer = new SubtitleAnalyzer(NullLogger<SubtitleAnalyzer>.Instance, ffmpeg, database, config);
+
+        await analyzer.AnalyzeMediaFiles([episode], AnalysisMode.Preview, CancellationToken.None);
+
+        (double Start, double End, SegmentSource Source)[] expected = matches ? [(150, 180, SegmentSource.Subtitle)] : [];
+        Assert.Equal(expected, await StoredSegmentsAsync(database, episodeId, AnalysisMode.Preview));
+    }
+
     [Fact]
     public async Task DisabledSubtitleModeDoesNotReadSubtitles()
     {

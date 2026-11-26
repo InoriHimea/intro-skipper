@@ -422,6 +422,12 @@ export const configSchema = {
         description:
             "Playback only. Seconds kept at the end of the media outside any Outro, so skipping never jumps to the very last frame. -1 (default) uses Intro End Offset; 0 disables the protection. Changing it never triggers re-analysis.",
     },
+    ApplyOutroTailBufferToPreview: {
+        kind: "checkbox",
+        label: "Also apply the tail buffer to Preview segments at the end",
+        description:
+            "Playback and EDL only. Caps Preview segments (such as post-credits anime previews derived up to EOF) at the same tail buffer so skipping a preview never jumps straight to the next episode.",
+    },
     ApplyOffsetsToForeignOutro: {
         kind: "checkbox",
         label: "Apply credits offsets to other providers' Outro segments",
@@ -432,13 +438,31 @@ export const configSchema = {
         kind: "checkbox",
         label: "Write .edl files next to media",
         description:
-            "When enabled, Intro Skipper writes and keeps a sidecar .edl file for each item whenever its segments change, for players that read EDL files. It overwrites an existing .edl of the same name, but only removes files it wrote itself. Requires 'Update Missing Segments During Scan'.",
+            "When enabled, Intro Skipper writes and keeps a sidecar .edl file (Intro and Outro by default) for each item whenever its segments change, honoring First Episode Intro Mode. Overwrites an existing .edl of the same name, but only deletes files it wrote itself. Requires 'Update Missing Segments During Scan'.",
     },
     ApplyOutroTailBufferToEdl: {
         kind: "checkbox",
         label: "Keep the outro tail buffer in .edl files",
         description:
-            "When enabled, written .edl files end every Outro at least the outro tail buffer before the end of the media, like the playback API.",
+            "When enabled, written .edl files end every Outro (and Preview when enabled) at least the outro tail buffer before the end of the media, like the playback API.",
+    },
+    EdlIncludeRecap: {
+        kind: "checkbox",
+        label: "Include Recap segments in .edl files",
+        description:
+            "Also write Recap segments into sidecar .edl files as skip markers.",
+    },
+    EdlIncludePreview: {
+        kind: "checkbox",
+        label: "Include Preview segments in .edl files",
+        description:
+            "Also write Preview segments into sidecar .edl files as skip markers. Leave off if you want to watch next-episode previews or avoid skipping post-credits scenes.",
+    },
+    EdlIncludeCommercial: {
+        kind: "checkbox",
+        label: "Include Commercial segments in .edl files",
+        description:
+            "Also write Commercial segments into sidecar .edl files as skip markers.",
     },
 
     // Black frame
@@ -562,9 +586,9 @@ export const configSchema = {
         kind: "regex",
         label: "Preview regex for subtitles",
         description:
-            "Matches text-subtitle cues announcing a preview. Enable preview matching for a season or show in Timestamps > Manage.",
+            "Matches text-subtitle cues announcing a preview (English, Japanese, Chinese and Korean by default). Enable preview matching for a season or show in Timestamps > Manage.",
         default:
-            "\\b(?:here(?:'|’)?s|now)\\s+the\\s+preview\\b|^\\W*(?:\\[[^\\]]*\\]|\\([^)]*\\)|[^\\s:]+:)?\\s*next\\s+time\\b",
+            "\\b(?:here(?:'|’)?s|now)\\s+the\\s+preview\\b|^[^A-Za-z0-9\\u00C0-\\u024F\\u3040-\\u30FF\\u4E00-\\u9FFF\\uAC00-\\uD7A3]*(?:\\[[^\\]]*\\]|\\([^)]*\\)|（[^）]*）|【[^】]*】|[^\\s:：]+[:：])?\\s*(?:next\\s+time\\b|(?:次回予告|下[集回][預预]告|다음\\s*(?:화|이야기)\\s*예고)(?=$|[\\s:：!！?？…。「『【\\]）】\\-—~～,，、.]|第))",
     },
     // FFmpeg
     PreferredAudioLanguage: {

@@ -17,6 +17,10 @@ namespace IntroSkipper.Community;
 /// <param name="DisplayOrder">The series display order; empty for the default (aired) order.</param>
 /// <param name="Duration">Local file duration in seconds.</param>
 /// <param name="MalId">MyAnimeList id of the series or movie when a metadata plugin set one.</param>
+/// <param name="SeasonMalId">MyAnimeList id set directly on the episode's season when present.</param>
+/// <param name="AniListId">AniList id of the season, or of the series for season 1 or a movie.</param>
+/// <param name="AniDbId">AniDB id of the season, or of the series for season 1 or a movie.</param>
+/// <param name="KitsuId">Kitsu id of the season, or of the series for season 1 or a movie.</param>
 public sealed record CommunityLookup(
     bool IsMovie,
     string? ImdbId,
@@ -26,4 +30,8 @@ public sealed record CommunityLookup(
     int? Episode,
     string DisplayOrder,
     double Duration,
-    string? MalId = null);
+    string? MalId = null,
+    string? SeasonMalId = null,
+    string? AniListId = null,
+    string? AniDbId = null,
+    string? KitsuId = null);

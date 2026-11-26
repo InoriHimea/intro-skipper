@@ -13,14 +13,16 @@ using IntroSkipper.Configuration;
 using IntroSkipper.Data;
 using IntroSkipper.Helper;
 using IntroSkipper.Manager;
+using MediaBrowser.Controller.Entities.TV;
+using MediaBrowser.Model.Entities;
 using Microsoft.Extensions.Logging.Abstractions;
 using Xunit;
 
 namespace IntroSkipper.Tests;
 
 /// <summary>
-/// AniSkip answers and id resolution, and the retry of recently added episodes that community
-/// lookups left empty.
+/// AniSkip answers and id resolution (including multi-season ARM v2 mapping), and the retry of
+/// recently added episodes that community lookups left empty.
 /// </summary>
 public sealed class TestAniSkipAndRetry
 {
@@ -29,6 +31,16 @@ public sealed class TestAniSkipAndRetry
           {"interval":{"startTime":50,"endTime":60},"skipType":"mixed-op","episodeLength":1420.1},
           {"interval":{"startTime":10.5,"endTime":100.25},"skipType":"op","episodeLength":1420.1},
           {"interval":{"startTime":1330,"endTime":1420},"skipType":"ed","episodeLength":1420.1}]}
+        """;
+
+    private const string MultiSeasonArmArray = """
+        [
+          {"myanimelist":38000,"thetvdb":348545,"thetvdb-season":1,"themoviedb":85937,"themoviedb-season":1,"media":"TV"},
+          {"myanimelist":49926,"thetvdb":348545,"thetvdb-season":2,"themoviedb":85937,"themoviedb-season":2,"media":"TV"},
+          {"myanimelist":40456,"thetvdb":348545,"thetvdb-season":0,"themoviedb":85937,"themoviedb-season":null,"media":"MOVIE"},
+          {"myanimelist":50265,"thetvdb":999,"thetvdb-season":4,"themoviedb":120089,"themoviedb-season":4,"media":"TV"},
+          {"myanimelist":50602,"thetvdb":999,"thetvdb-season":4,"themoviedb":120089,"themoviedb-season":4,"media":"TV"}
+        ]
         """;
 
     [Fact]
@@ -56,51 +68,103 @@ public sealed class TestAniSkipAndRetry
     }
 
     [Fact]
-    public async Task DirectMalIdIsUsedForAnySeasonWithoutMapping()
+    public async Task SeasonMalIdWinsOverSeriesMalIdWithoutMapping()
     {
         var handler = new RecordingHandler(_ => Reply(HttpStatusCode.OK, Found));
         var source = Source(handler);
 
-        var answer = await source.LookupAsync(Lookup(season: 2, episode: 5, mal: "5114"), CancellationToken.None);
+        var answer = await source.LookupAsync(Lookup(season: 2, episode: 5, mal: "38000", seasonMal: "49926"), CancellationToken.None);
 
         Assert.Equal(CommunityAnswerKind.Found, answer.Kind);
-        Assert.Equal([AniSkipSource.BuildUrl(5114, 5)], handler.Urls);
+        Assert.Equal([AniSkipSource.BuildUrl(49926, 5)], handler.Urls);
+        Assert.Equal(CommunityAnswerKind.NotFound, (await source.LookupAsync(Lookup(season: 0, episode: 1, mal: "5114"), CancellationToken.None)).Kind);
     }
 
     [Fact]
-    public async Task MalIdIsMappedFromGeneralIdsForSeasonOneOnlyAndRemembered()
+    public async Task MultiSeasonArmArrayResolvesUnambiguousSeasonsAndMoviesAndSkipsSplitCour()
     {
-        var handler = new RecordingHandler(url => url.StartsWith(AniSkipSource.MappingUrl, StringComparison.Ordinal)
-            ? Reply(HttpStatusCode.OK, """{"myanimelist":5114,"thetvdb":81797}""")
+        var handler = new RecordingHandler(url => url.StartsWith(AniSkipSource.ArmBaseUrl, StringComparison.Ordinal)
+            ? Reply(HttpStatusCode.OK, MultiSeasonArmArray)
             : Reply(HttpStatusCode.OK, Found));
         var source = Source(handler);
 
-        Assert.Equal(CommunityAnswerKind.Found, (await source.LookupAsync(Lookup(season: 1, episode: 1, tvdb: "81797"), CancellationToken.None)).Kind);
-        Assert.Equal(CommunityAnswerKind.Found, (await source.LookupAsync(Lookup(season: 1, episode: 2, tvdb: "81797"), CancellationToken.None)).Kind);
-        Assert.Single(handler.Urls.FindAll(u => u.StartsWith(AniSkipSource.MappingUrl, StringComparison.Ordinal)));
-        Assert.Contains(AniSkipSource.BuildUrl(5114, 2), handler.Urls);
+        // Season 1 and Season 2 both resolve from one cached /api/v2/thetvdb request.
+        Assert.Equal(CommunityAnswerKind.Found, (await source.LookupAsync(Lookup(season: 1, episode: 1, tvdb: "348545"), CancellationToken.None)).Kind);
+        Assert.Equal(CommunityAnswerKind.Found, (await source.LookupAsync(Lookup(season: 2, episode: 3, tvdb: "348545"), CancellationToken.None)).Kind);
+        Assert.Single(handler.Urls.FindAll(u => u == AniSkipSource.BuildSeriesMappingUrl("thetvdb", "348545")));
+        Assert.Contains(AniSkipSource.BuildUrl(38000, 1), handler.Urls);
+        Assert.Contains(AniSkipSource.BuildUrl(49926, 3), handler.Urls);
 
+        // Split-cour season 4 maps to two distinct MAL ids (50265 and 50602), so it is refused safely as NotFound.
         handler.Urls.Clear();
-        Assert.Equal(CommunityAnswerKind.NotFound, (await source.LookupAsync(Lookup(season: 2, episode: 1, tvdb: "81797"), CancellationToken.None)).Kind);
-        Assert.Equal(CommunityAnswerKind.NotFound, (await source.LookupAsync(Lookup(season: 0, episode: 1, mal: "5114"), CancellationToken.None)).Kind);
+        Assert.Equal(CommunityAnswerKind.NotFound, (await source.LookupAsync(Lookup(season: 4, episode: 1, tvdb: "348545"), CancellationToken.None)).Kind);
         Assert.Empty(handler.Urls);
+
+        // Movie entry picks media == "MOVIE".
+        var movieLookup = new CommunityLookup(true, null, "85937", null, null, null, string.Empty, 7000);
+        Assert.Equal(CommunityAnswerKind.Found, (await source.LookupAsync(movieLookup, CancellationToken.None)).Kind);
+        Assert.Contains(AniSkipSource.BuildUrl(40456, 1), handler.Urls);
     }
 
     [Fact]
-    public async Task UnknownMappingIsAMissAndATransientFailureStaysRetriable()
+    public async Task SingleSeasonAniListIdResolvesViaIdsEndpoint()
     {
-        var status = HttpStatusCode.NotFound;
-        var handler = new RecordingHandler(_ => Reply(status, "{}"));
+        var handler = new RecordingHandler(url => url.StartsWith(AniSkipSource.MappingUrl, StringComparison.Ordinal)
+            ? Reply(HttpStatusCode.OK, """{"myanimelist":52991}""")
+            : Reply(HttpStatusCode.OK, Found));
         var source = Source(handler);
 
+        var series = new Series { Id = Guid.NewGuid(), Name = "Frieren" };
+        var season2 = new Season { Id = Guid.NewGuid(), SeriesId = series.Id, IndexNumber = 2 };
+        season2.ProviderIds["AniList"] = "182255";
+        var episode = new Episode
+        {
+            Id = Guid.NewGuid(),
+            SeriesId = series.Id,
+            SeasonId = season2.Id,
+            ParentIndexNumber = 2,
+            IndexNumber = 4,
+            RunTimeTicks = 1420 * TimeSpan.TicksPerSecond,
+        };
+        var lookup = CommunityFallback.CreateLookup(episode, id => id == series.Id ? series : id == season2.Id ? season2 : null)!;
+
+        Assert.Equal("182255", lookup.AniListId);
+        Assert.Equal(CommunityAnswerKind.Found, (await source.LookupAsync(lookup, CancellationToken.None)).Kind);
+        Assert.Contains($"{AniSkipSource.MappingUrl}?source=anilist&id=182255", handler.Urls);
+        Assert.Contains(AniSkipSource.BuildUrl(52991, 4), handler.Urls);
+    }
+
+    [Fact]
+    public async Task UnknownOrBadRequestMappingIsAMissAndTransientFailureStaysRetriable()
+    {
+        var status = HttpStatusCode.BadRequest;
+        var handler = new RecordingHandler(_ => Reply(status, """{"statusCode":400}"""));
+        var source = Source(handler);
+
+        // 400 and 404 are definitive misses and cached, never marking the item Unavailable.
         Assert.Equal(CommunityAnswerKind.NotFound, (await source.LookupAsync(Lookup(season: 1, episode: 1, tvdb: "1"), CancellationToken.None)).Kind);
         Assert.Equal(CommunityAnswerKind.NotFound, (await source.LookupAsync(Lookup(season: 1, episode: 1, tvdb: "1"), CancellationToken.None)).Kind);
-        Assert.Single(handler.Urls); // the miss was remembered
+        Assert.Single(handler.Urls);
 
         status = HttpStatusCode.InternalServerError;
         Assert.Equal(CommunityAnswerKind.Unavailable, (await source.LookupAsync(Lookup(season: 1, episode: 1, tvdb: "2"), CancellationToken.None)).Kind);
         Assert.Equal(CommunityAnswerKind.Unavailable, (await source.LookupAsync(Lookup(season: 1, episode: 1, tvdb: "2"), CancellationToken.None)).Kind);
-        Assert.Equal(3, handler.Urls.Count); // the failure was not remembered
+        Assert.Equal(3, handler.Urls.Count);
+    }
+
+    [Fact]
+    public async Task DescribeStatusReportsDisabledReadyAndRateLimitCooldown()
+    {
+        var now = new DateTimeOffset(2026, 11, 27, 0, 0, 0, TimeSpan.Zero);
+        var response = new HttpResponseMessage(HttpStatusCode.TooManyRequests);
+        response.Headers.RetryAfter = new System.Net.Http.Headers.RetryConditionHeaderValue(TimeSpan.FromMinutes(10));
+        var source = new AniSkipSource(new Factory(new RecordingHandler(_ => response)), NullLogger<AniSkipSource>.Instance, new FixedTime(now));
+
+        Assert.Equal("disabled", source.DescribeStatus(new PluginConfiguration { CommunityUseAniSkip = false }, now));
+        Assert.Equal("ready", source.DescribeStatus(new PluginConfiguration { CommunityUseAniSkip = true }, now));
+
+        _ = await source.LookupAsync(Lookup(season: 1, episode: 1, mal: "38000"), CancellationToken.None);
+        Assert.Equal("rate-limited (10 min left)", source.DescribeStatus(new PluginConfiguration { CommunityUseAniSkip = true }, now));
     }
 
     [Fact]
@@ -180,8 +244,8 @@ public sealed class TestAniSkipAndRetry
     private static HttpResponseMessage Reply(HttpStatusCode status, string body)
         => new(status) { Content = new StringContent(body, Encoding.UTF8, "application/json") };
 
-    private static CommunityLookup Lookup(int season, int episode, string? tvdb = null, string? mal = null)
-        => new(false, null, null, tvdb, season, episode, string.Empty, 1420.032, mal);
+    private static CommunityLookup Lookup(int season, int episode, string? tvdb = null, string? mal = null, string? seasonMal = null)
+        => new(false, null, null, tvdb, season, episode, string.Empty, 1420.032, mal, seasonMal);
 
     private static AniSkipSource Source(RecordingHandler handler)
         => new(new Factory(handler), NullLogger<AniSkipSource>.Instance, TimeProvider.System);

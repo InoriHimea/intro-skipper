@@ -52,7 +52,7 @@ public sealed partial class MediaSegmentsFirstEpisodeFilter(
             return;
         }
 
-        if (_libraryManager.GetItemById(itemId) is not Episode episode || !IsFirstEpisode(episode) || !IsFilteredEpisode(episode))
+        if (_libraryManager.GetItemById(itemId) is not Episode episode || !ShouldFilterIntro(_libraryManager, episode, Plugin.Instance?.Configuration, _logger))
         {
             await next().ConfigureAwait(false);
             return;
@@ -80,11 +80,40 @@ public sealed partial class MediaSegmentsFirstEpisodeFilter(
         await next().ConfigureAwait(false);
     }
 
-    private bool IsFirstEpisode(Episode episode)
+    /// <summary>
+    /// Returns whether the configured first-episode policy suppresses <c>Intro</c> segments for
+    /// <paramref name="item"/>. Shared by the playback filter and the sidecar <c>.edl</c> writer.
+    /// </summary>
+    /// <param name="libraryManager">Library manager.</param>
+    /// <param name="item">Candidate library item.</param>
+    /// <param name="configuration">Plugin configuration.</param>
+    /// <param name="logger">Optional logger for diagnostics.</param>
+    /// <returns><see langword="true"/> when <paramref name="item"/> is a season premiere whose intros should be suppressed.</returns>
+    internal static bool ShouldFilterIntro(
+        ILibraryManager libraryManager,
+        BaseItem? item,
+        PluginConfiguration? configuration,
+        ILogger? logger = null)
+    {
+        if (configuration is null
+            || configuration.FirstEpisodeIntroMode == PluginConfiguration.FirstEpisodeIntroModeAnalyze
+            || item is not Episode episode)
+        {
+            return false;
+        }
+
+        return IsFirstEpisode(libraryManager, episode, logger) && IsFilteredEpisode(libraryManager, episode, configuration.FirstEpisodeIntroMode);
+    }
+
+    private static bool IsFirstEpisode(ILibraryManager libraryManager, Episode episode, ILogger? logger)
     {
         if (episode.SeasonId == Guid.Empty)
         {
-            LogEpisodeMissingSeasonId(_logger, episode.Id);
+            if (logger is not null)
+            {
+                LogEpisodeMissingSeasonId(logger, episode.Id);
+            }
+
             return false;
         }
 
@@ -100,22 +129,25 @@ public sealed partial class MediaSegmentsFirstEpisodeFilter(
             Limit = 1
         };
 
-        var firstEpisode = _libraryManager.GetItemList(query, false)
+        var firstEpisode = libraryManager.GetItemList(query, false)
             .OfType<Episode>()
             .FirstOrDefault();
 
         if (firstEpisode is null)
         {
-            LogNoFirstEpisodeFound(_logger, episode.SeasonId);
+            if (logger is not null)
+            {
+                LogNoFirstEpisodeFound(logger, episode.SeasonId);
+            }
+
             return false;
         }
 
         return firstEpisode.Id == episode.Id;
     }
 
-    private bool IsFilteredEpisode(Episode episode)
+    private static bool IsFilteredEpisode(ILibraryManager libraryManager, Episode episode, string? mode)
     {
-        var mode = Plugin.Instance?.Configuration.FirstEpisodeIntroMode;
         if (mode == PluginConfiguration.FirstEpisodeIntroModeIgnore)
         {
             return true;
@@ -123,8 +155,8 @@ public sealed partial class MediaSegmentsFirstEpisodeFilter(
 
         // When anime restriction is enabled, only filter anime series.
         return mode == PluginConfiguration.FirstEpisodeIntroModeIgnoreAnime
-            && episode.Series is Series series &&
-            SeriesHelper.IsAnime(series);
+            && (episode.Series ?? libraryManager.GetItemById(episode.SeriesId) as Series) is Series series
+            && SeriesHelper.IsAnime(series);
     }
 
     private static bool TryGetItemId(ResultExecutingContext context, out Guid itemId)

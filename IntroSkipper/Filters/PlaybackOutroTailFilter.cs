@@ -12,8 +12,9 @@ using Microsoft.AspNetCore.Mvc.Filters;
 namespace IntroSkipper.Filters;
 
 /// <summary>
-/// Keeps the configured tail outside Outro segments returned by the native playback API.
-/// Stored segments and canonical editor responses retain their original boundaries.
+/// Keeps the configured tail outside Outro (and optionally tail-reaching Preview) segments
+/// returned by the native playback API. Stored segments and canonical editor responses retain
+/// their original boundaries.
 /// </summary>
 /// <param name="libraryManager">Library manager.</param>
 public sealed class PlaybackOutroTailFilter(ILibraryManager libraryManager) : IAsyncResultFilter
@@ -23,7 +24,9 @@ public sealed class PlaybackOutroTailFilter(ILibraryManager libraryManager) : IA
     /// <inheritdoc />
     public async Task OnResultExecutionAsync(ResultExecutingContext context, ResultExecutionDelegate next)
     {
-        var keepSeconds = Plugin.Instance?.Configuration.EffectiveOutroTailBufferSeconds ?? 0;
+        var configuration = Plugin.Instance?.Configuration;
+        var keepSeconds = configuration?.EffectiveOutroTailBufferSeconds ?? 0;
+        var clipPreview = configuration?.ApplyOutroTailBufferToPreview ?? false;
         if (keepSeconds <= 0 ||
             !HttpMethods.IsGet(context.HttpContext.Request.Method) ||
             context.ActionDescriptor is not ControllerActionDescriptor action ||
@@ -42,7 +45,7 @@ public sealed class PlaybackOutroTailFilter(ILibraryManager libraryManager) : IA
         if ((statusCode ?? context.HttpContext.Response.StatusCode) != StatusCodes.Status200OK ||
             value is not QueryResult<MediaSegmentDto> segments ||
             segments.Items is null ||
-            !segments.Items.Any(segment => segment.Type == MediaSegmentType.Outro) ||
+            !segments.Items.Any(segment => IsProtectedType(segment.Type, clipPreview)) ||
             !context.RouteData.Values.TryGetValue("itemId", out var routeItemId) ||
             !Guid.TryParse(routeItemId?.ToString(), out var itemId) ||
             itemId == Guid.Empty)
@@ -54,7 +57,7 @@ public sealed class PlaybackOutroTailFilter(ILibraryManager libraryManager) : IA
         var durationTicks = _libraryManager.GetItemById(itemId)?.RunTimeTicks;
         if (durationTicks is > 0)
         {
-            var clipped = ClipSegments(segments, durationTicks.Value, keepSeconds);
+            var clipped = ClipSegments(segments, durationTicks.Value, keepSeconds, clipPreview);
             if (context.Result is ObjectResult objectResult)
             {
                 objectResult.Value = clipped;
@@ -69,20 +72,21 @@ public sealed class PlaybackOutroTailFilter(ILibraryManager libraryManager) : IA
     }
 
     /// <summary>
-    /// Clips Outro boundaries without mutating the response, its collection or its DTOs.
+    /// Clips Outro (and optionally Preview) boundaries without mutating the response, its collection or its DTOs.
     /// </summary>
     /// <param name="segments">Original response.</param>
     /// <param name="durationTicks">Media duration.</param>
     /// <param name="keepSeconds">Tail length to keep.</param>
+    /// <param name="clipPreview">Whether Preview segments reaching into the protected tail are also capped.</param>
     /// <returns>The original response when unchanged, otherwise a clipped copy.</returns>
-    internal static QueryResult<MediaSegmentDto> ClipSegments(QueryResult<MediaSegmentDto> segments, long durationTicks, int keepSeconds)
+    internal static QueryResult<MediaSegmentDto> ClipSegments(QueryResult<MediaSegmentDto> segments, long durationTicks, int keepSeconds, bool clipPreview = false)
     {
         var items = new List<MediaSegmentDto>();
         var changed = false;
         var removed = 0;
         foreach (var segment in segments.Items)
         {
-            var clipped = ClipOutro(segment, durationTicks, keepSeconds);
+            var clipped = ClipOutro(segment, durationTicks, keepSeconds, clipPreview);
             changed |= !ReferenceEquals(segment, clipped);
             if (clipped is null)
             {
@@ -105,15 +109,17 @@ public sealed class PlaybackOutroTailFilter(ILibraryManager libraryManager) : IA
     }
 
     /// <summary>
-    /// Caps one Outro at the protected tail, without extending an earlier end.
+    /// Caps one Outro (or Preview when <paramref name="clipPreview"/> is enabled) at the protected
+    /// tail, without extending an earlier end.
     /// </summary>
     /// <param name="segment">Original segment.</param>
     /// <param name="durationTicks">Media duration.</param>
     /// <param name="keepSeconds">Tail length to keep.</param>
+    /// <param name="clipPreview">Whether Preview segments reaching into the protected tail are also capped.</param>
     /// <returns>The original or clipped segment, or null when no valid skip range remains.</returns>
-    internal static MediaSegmentDto? ClipOutro(MediaSegmentDto segment, long durationTicks, int keepSeconds)
+    internal static MediaSegmentDto? ClipOutro(MediaSegmentDto segment, long durationTicks, int keepSeconds, bool clipPreview = false)
     {
-        if (segment.Type != MediaSegmentType.Outro || durationTicks <= 0 || keepSeconds <= 0)
+        if (!IsProtectedType(segment.Type, clipPreview) || durationTicks <= 0 || keepSeconds <= 0)
         {
             return segment;
         }
@@ -136,4 +142,7 @@ public sealed class PlaybackOutroTailFilter(ILibraryManager libraryManager) : IA
                 EndTicks = endTicks
             };
     }
+
+    private static bool IsProtectedType(MediaSegmentType type, bool clipPreview)
+        => type == MediaSegmentType.Outro || (clipPreview && type == MediaSegmentType.Preview);
 }

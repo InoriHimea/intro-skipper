@@ -14,6 +14,7 @@ import type {
     LibraryStorage,
     SystemStorageInfo,
     ClearExcludedTimestampsResponse,
+    EdlSyncResponse,
     SegmentType,
     SupportBundle,
 } from "../types.ts";
@@ -354,6 +355,10 @@ export function rebuildDatabase(
 
 export function resetConfiguration(signal?: AbortSignal): Promise<ApiResult<null>> {
     return request<null>("IntroSkipper/Configuration/Reset", { method: "POST", signal });
+}
+
+export function syncEdlFiles(signal?: AbortSignal): Promise<ApiResult<EdlSyncResponse>> {
+    return request<EdlSyncResponse>("IntroSkipper/Edl/Sync", { method: "POST", signal });
 }
 
 // Skip button web patch helpers.

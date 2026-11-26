@@ -99,6 +99,13 @@ export type ClearExcludedTimestampsResponse = {
     RemovedCacheEntries: number;
 };
 
+export type EdlSyncResponse = {
+    Written: number;
+    Unchanged: number;
+    Removed: number;
+    Failed: number;
+};
+
 // Support bundle returned by IntroSkipper/SupportBundle/Json. A section holds
 // either Entries (facts) or Text (a preformatted block); collapsed sections are
 // noise that stays folded until expanded.

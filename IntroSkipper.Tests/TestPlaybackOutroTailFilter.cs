@@ -78,7 +78,7 @@ public class TestPlaybackOutroTailFilter
     }
 
     [Fact]
-    public void EveryNonOutroTypeIsUnchanged()
+    public void EveryNonOutroTypeIsUnchangedByDefault()
     {
         foreach (var type in Enum.GetValues<MediaSegmentType>().Append((MediaSegmentType)123).Where(type => type != MediaSegmentType.Outro))
         {
@@ -86,6 +86,28 @@ public class TestPlaybackOutroTailFilter
             Assert.Same(input, PlaybackOutroTailFilter.ClipOutro(input, 100 * TicksPerSecond, 5));
             Assert.Equal(100 * TicksPerSecond, input.EndTicks);
         }
+    }
+
+    [Theory]
+    [InlineData(true, 100, 95)]
+    [InlineData(true, 90, 90)]
+    [InlineData(false, 100, 100)]
+    public async Task PreviewTailBufferRespectsConfigurationFlag(bool protectPreview, long previewEnd, long expectedEnd)
+    {
+        using var scope = EntrypointTestHelpers.CreatePluginScope(new PluginConfiguration
+        {
+            OutroTailBufferSeconds = 5,
+            ApplyOutroTailBufferToPreview = protectPreview,
+        });
+        var id = Guid.NewGuid();
+        var library = EntrypointTestHelpers.CreateLibraryManager(new Episode { Id = id, RunTimeTicks = 100 * TicksPerSecond });
+        var preview = PlaybackFilterTestHelpers.Segment(id, 80 * TicksPerSecond, previewEnd * TicksPerSecond, MediaSegmentType.Preview);
+        var result = new OkObjectResult(new QueryResult<MediaSegmentDto>([preview]));
+
+        await PlaybackFilterTestHelpers.RunAsync(PlaybackFilterTestHelpers.CreateContext(id, result), new PlaybackOutroTailFilter(library));
+
+        var served = Assert.Single(Assert.IsType<QueryResult<MediaSegmentDto>>(result.Value).Items);
+        Assert.Equal(expectedEnd * TicksPerSecond, served.EndTicks);
     }
 
     [Fact]

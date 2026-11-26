@@ -153,4 +153,17 @@ public class TestPluginConfiguration
 
         Assert.Equal(upgraded ? new PluginConfiguration().ChapterAnalyzerEndCreditsPattern : saved, config.ChapterAnalyzerEndCreditsPattern);
     }
+
+    [Theory]
+    [InlineData(PluginConfiguration.LegacyDefaultSubtitlePreviewPattern, true)]
+    [InlineData(PluginConfiguration.LegacyDefaultSubtitlePreviewPattern + "|予告", false)]
+    [InlineData("次回予告", false)]
+    public void UpgradeLegacyDefaults_ReplacesOnlyAnUntouchedOldSubtitlePreviewDefault(string saved, bool upgraded)
+    {
+        var config = new PluginConfiguration { SubtitlePreviewPattern = saved };
+
+        config.UpgradeLegacyDefaults();
+
+        Assert.Equal(upgraded ? new PluginConfiguration().SubtitlePreviewPattern : saved, config.SubtitlePreviewPattern);
+    }
 }

@@ -16,7 +16,7 @@ export const communityTab: Tab = {
                 { className: "field-description" },
                 "<p>Local analysis always runs first. Only an episode or movie it settles <b>without</b> an intro or credits segment is looked up in the community databases, one request per item. A community result never replaces a local or user segment.</p>" +
                     "<p>Community timestamps receive the same boundary adjustments as detected ones, so the Segment Offset Adjustment settings on the Detection tab apply to them.</p>" +
-                    "<p>Lookups use the series' IMDb, TMDB and TVDB ids. Enabling or changing these settings re-checks intro and credits results once on the next scan.</p>",
+                    "<p>Lookups use the series' IMDb, TMDB and TVDB ids, plus season or series MyAnimeList/AniList/AniDB/Kitsu ids (with multi-season ARM v2 mapping for AniSkip). Enabling or changing these settings re-checks intro and credits results once on the next scan.</p>",
             ),
             form.field("EnableCommunityFallback"),
             form.field("EnableOnDemandPlaybackCommunityLookup", { visible: enabled }),

@@ -134,9 +134,35 @@ export const toolsTab: Tab = {
             window.Dashboard.alert("Settings reset to defaults");
         });
 
+        const edlSyncBtn = el(
+            "button",
+            { className: "action-button", type: "button" },
+            "Sync / Clean Managed .edl Files",
+        );
+        edlSyncBtn.addEventListener("click", async () => {
+            const writeEnabled = configStore.get("WriteEdlOnSegmentChange") === true;
+            const result = await confirmDialog({
+                title: writeEnabled ? "Sync Managed .edl Files" : "Remove Managed .edl Files",
+                body: writeEnabled
+                    ? "Synchronize sidecar .edl files across the library using the current saved tail buffer, segment type, and first-episode settings, and prune orphaned entries?"
+                    : "Write .edl files is currently disabled. Remove all .edl files previously created and tracked by Intro Skipper? Hand-made or foreign .edl files are never touched.",
+                confirmLabel: writeEnabled ? "Sync" : "Remove",
+            });
+            if (!result) return;
+            const response = await api.syncEdlFiles();
+            if (!response.ok || !response.data) {
+                window.Dashboard.alert("Failed to sync .edl files");
+                return;
+            }
+            const { Written, Unchanged, Removed, Failed } = response.data;
+            const summary = `EDL sync complete — Written: ${Written}, Unchanged: ${Unchanged}, Removed: ${Removed}` + (Failed > 0 ? `, Failed: ${Failed}` : "");
+            window.Dashboard.alert(summary);
+        });
+
         container.append(
             globalSelectGroup,
             globalEraseBtn,
+            edlSyncBtn,
             rebuildBtn,
             resetBtn,
         );

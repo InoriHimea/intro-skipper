@@ -61,8 +61,9 @@ internal sealed partial class CommunityFallback(
         var effectiveDuration = duration > 0 ? duration : TimeSpan.FromTicks(item.RunTimeTicks ?? 0).TotalSeconds;
         if (item is Episode episode)
         {
+            var seasonItem = episode.SeasonId != Guid.Empty ? getItem(episode.SeasonId) : null;
             return getItem(episode.SeriesId) is Series series
-                ? CreateEpisodeLookup(series, episode.ParentIndexNumber, episode.IndexNumber, effectiveDuration)
+                ? CreateEpisodeLookup(series, seasonItem, episode.ParentIndexNumber, episode.IndexNumber, effectiveDuration)
                 : null;
         }
 
@@ -75,7 +76,10 @@ internal sealed partial class CommunityFallback(
             null,
             string.Empty,
             effectiveDuration,
-            MalId(item));
+            MalId(item),
+            AniListId: CustomProviderId(item, "AniList"),
+            AniDbId: CustomProviderId(item, "AniDB", "AniDb"),
+            KitsuId: CustomProviderId(item, "Kitsu"));
     }
 
     /// <summary>
@@ -243,13 +247,14 @@ internal sealed partial class CommunityFallback(
                 : null;
         }
 
-        // The series carries the ids the databases address episodes by.
+        // The series carries general-purpose ids; the season may carry its own single-cour anime id.
+        var seasonItem = episode.SeasonId != Guid.Empty ? plugin?.GetItem(episode.SeasonId) : null;
         return plugin?.GetItem(episode.SeriesId) is Series series
-            ? CreateEpisodeLookup(series, episode.SeasonNumber, episode.EpisodeNumber, episode.Duration)
+            ? CreateEpisodeLookup(series, seasonItem, episode.SeasonNumber, episode.EpisodeNumber, episode.Duration)
             : null;
     }
 
-    private static CommunityLookup CreateEpisodeLookup(Series series, int? season, int? episode, double duration)
+    private static CommunityLookup CreateEpisodeLookup(Series series, BaseItem? seasonItem, int? season, int? episode, double duration)
         => new(
             false,
             Id(series, MetadataProvider.Imdb),
@@ -259,12 +264,43 @@ internal sealed partial class CommunityFallback(
             episode,
             series.DisplayOrder ?? string.Empty,
             duration,
-            MalId(series));
+            MalId(series),
+            SeasonMalId: MalId(seasonItem),
+            AniListId: SingleSeasonProviderId(series, seasonItem, season, "AniList"),
+            AniDbId: SingleSeasonProviderId(series, seasonItem, season, "AniDB", "AniDb"),
+            KitsuId: SingleSeasonProviderId(series, seasonItem, season, "Kitsu"));
 
     // Metadata plugins for anime store the MyAnimeList id under one of these names.
-    private static string? MalId(BaseItem item)
-        => item.ProviderIds.TryGetValue("MyAnimeList", out var id) && !string.IsNullOrWhiteSpace(id) ? id
-            : item.ProviderIds.TryGetValue("Mal", out id) && !string.IsNullOrWhiteSpace(id) ? id : null;
+    private static string? MalId(BaseItem? item) => CustomProviderId(item, "MyAnimeList", "Mal");
+
+    private static string? SingleSeasonProviderId(Series series, BaseItem? seasonItem, int? season, params string[] keys)
+        => CustomProviderId(seasonItem, keys) ?? (season == 1 ? CustomProviderId(series, keys) : null);
+
+    private static string? CustomProviderId(BaseItem? item, params string[] keys)
+    {
+        if (item?.ProviderIds is null)
+        {
+            return null;
+        }
+
+        foreach (var key in keys)
+        {
+            if (item.ProviderIds.TryGetValue(key, out var id) && !string.IsNullOrWhiteSpace(id))
+            {
+                return id;
+            }
+
+            foreach (var pair in item.ProviderIds)
+            {
+                if (string.Equals(pair.Key, key, StringComparison.OrdinalIgnoreCase) && !string.IsNullOrWhiteSpace(pair.Value))
+                {
+                    return pair.Value;
+                }
+            }
+        }
+
+        return null;
+    }
 
     private static string? Id(BaseItem item, MetadataProvider provider)
         => item.TryGetProviderId(provider, out var id) && !string.IsNullOrWhiteSpace(id) ? id : null;

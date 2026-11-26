@@ -129,6 +129,7 @@ namespace IntroSkipper.Tests
 
             var filters = model.Controllers[0].Actions[0].Filters
                 .OfType<ServiceFilterAttribute>()
+                .OrderBy(factory => factory.Order)
                 .Select(factory => (IAsyncResultFilter)factory.CreateInstance(provider))
                 .ToArray();
             await RunAsync(context, filters);

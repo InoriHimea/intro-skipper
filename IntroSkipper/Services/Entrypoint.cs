@@ -10,6 +10,7 @@ using System.Runtime.Loader;
 using IntroSkipper.Configuration;
 using IntroSkipper.Db;
 using IntroSkipper.Helper;
+using IntroSkipper.Manager;
 using MediaBrowser.Controller.Entities;
 using MediaBrowser.Controller.Library;
 using MediaBrowser.Model.Entities;
@@ -28,16 +29,19 @@ namespace IntroSkipper.Services;
 /// <param name="cacheDatabase">Detection cache database facade.</param>
 /// <param name="logger">Logger.</param>
 /// <param name="queue">Analysis queue the changed items are handed to.</param>
+/// <param name="edlWriter">Optional sidecar <c>.edl</c> writer, notified when media items are removed.</param>
 public sealed partial class Entrypoint(
     ILibraryManager libraryManager,
     DetectionCacheDatabase cacheDatabase,
     ILogger<Entrypoint> logger,
-    AnalysisScheduler queue) : IHostedService
+    AnalysisScheduler queue,
+    EdlFileWriter? edlWriter = null) : IHostedService
 {
     private readonly ILibraryManager _libraryManager = libraryManager;
     private readonly DetectionCacheDatabase _cacheDatabase = cacheDatabase;
     private readonly ILogger<Entrypoint> _logger = logger;
     private readonly AnalysisScheduler _queue = queue;
+    private readonly EdlFileWriter? _edlWriter = edlWriter;
 
     // Jellyfin replaces the configuration object on save, so the live instance is read on
     // every use instead of a constructor-time snapshot.
@@ -147,6 +151,7 @@ public sealed partial class Entrypoint(
         LogMediaItemRemoved(item.Id);
         // Best-effort: the facade logs and swallows database errors.
         _cacheDatabase.DeleteForItem(item.Id);
+        _edlWriter?.RemoveForMediaPath(item.Path);
     }
 
     // An episode or movie with a real location, while automatic analysis is on.

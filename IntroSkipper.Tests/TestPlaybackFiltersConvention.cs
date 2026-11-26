@@ -89,13 +89,17 @@ public class TestPlaybackFiltersConvention
     }
 
     [Fact]
-    public void ExistingFirstEpisodeFilterIsRetained()
+    public void ExistingFirstEpisodeFilterIsRetainedAfterFallback()
     {
         var model = PlaybackFilterTestHelpers.CreateModel(typeof(Jellyfin.Api.Controllers.MediaSegmentsController));
         new MediaSegmentsFilterConvention().Apply(model);
         new PlaybackFiltersConvention().Apply(model);
-        Assert.Equal(new[] { typeof(MediaSegmentsFirstEpisodeFilter), typeof(PlaybackCommunityFallbackFilter), typeof(PlaybackIntroOffsetFilter), typeof(PlaybackOutroTailFilter) },
-            model.Controllers[0].Actions[0].Filters.OfType<ServiceFilterAttribute>().Select(filter => filter.ServiceType));
+        var filters = model.Controllers[0].Actions[0].Filters.OfType<ServiceFilterAttribute>().ToArray();
+        Assert.Equal(
+            new[] { typeof(PlaybackCommunityFallbackFilter), typeof(MediaSegmentsFirstEpisodeFilter), typeof(PlaybackIntroOffsetFilter), typeof(PlaybackOutroTailFilter) },
+            filters.Select(filter => filter.ServiceType));
+        Assert.Equal(PlaybackFiltersConvention.FallbackFilterOrder, filters[0].Order);
+        Assert.True(filters[0].Order < filters[1].Order);
     }
 
     [Fact]

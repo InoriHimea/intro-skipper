@@ -29,4 +29,13 @@ public interface ICommunitySource
     /// <param name="cancellationToken">Cancellation token.</param>
     /// <returns>The answer; never throws for network or server failures.</returns>
     Task<CommunityAnswer> LookupAsync(CommunityLookup lookup, CancellationToken cancellationToken);
+
+    /// <summary>
+    /// Describes the current availability of this source for the support bundle.
+    /// </summary>
+    /// <param name="config">Plugin configuration.</param>
+    /// <param name="now">Current UTC time.</param>
+    /// <returns>A short human-readable status such as <c>ready</c>, <c>disabled</c>, or the remaining rate-limit cooldown.</returns>
+    string DescribeStatus(PluginConfiguration config, DateTimeOffset now)
+        => IsEnabled(config) ? "ready" : "disabled";
 }
