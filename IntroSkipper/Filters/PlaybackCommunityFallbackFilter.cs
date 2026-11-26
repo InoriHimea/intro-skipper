@@ -28,6 +28,11 @@ namespace IntroSkipper.Filters;
 internal sealed partial class PlaybackCommunityFallbackFilter : IAsyncResultFilter
 {
     /// <summary>
+    /// Upper bound on cached item-source entries.
+    /// </summary>
+    internal const int MaxCacheEntries = 2048;
+
+    /// <summary>
     /// Maximum wait before aborting an on-demand playback community lookup.
     /// </summary>
     internal static readonly TimeSpan LookupTimeout = TimeSpan.FromMilliseconds(1500);
@@ -42,11 +47,6 @@ internal sealed partial class PlaybackCommunityFallbackFilter : IAsyncResultFilt
     /// pick up community submissions later the same day.
     /// </summary>
     internal static readonly TimeSpan NotFoundTtl = TimeSpan.FromMinutes(20);
-
-    /// <summary>
-    /// Upper bound on cached item-source entries.
-    /// </summary>
-    internal const int MaxCacheEntries = 2048;
 
     private readonly ILibraryManager _libraryManager;
     private readonly ILogger<PlaybackCommunityFallbackFilter> _logger;
